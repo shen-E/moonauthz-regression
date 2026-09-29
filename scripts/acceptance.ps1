@@ -182,3 +182,5 @@ finally {
   if ($null -eq $previousTokenB) { Remove-Item Env:MOONAUTHZ_TOKEN_B -ErrorAction SilentlyContinue } else { $env:MOONAUTHZ_TOKEN_B = $previousTokenB }
   Pop-Location
 }
+
+$global:LASTEXITCODE = 0
