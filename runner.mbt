@@ -139,10 +139,14 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
   @fs.mkdir(output_dir, recursive=true, allow_exist=true)
   let cases : Array[TestCase] = []
   let setup_errors : Array[String] = []
-  let baseline_markers : Array[Array[Marker]] = [[], []]
-  let baseline_ok = [false, false]
+  let baseline_markers : Array[Array[Marker]] = []
+  let baseline_ok : Array[Bool] = []
+  for i = 0; i < config.identities.length(); i = i + 1 {
+    baseline_markers.push([])
+    baseline_ok.push(false)
+  }
 
-  // Owner reads prove that both test credentials and fixture objects are usable.
+  // Owner reads prove that every test credential and fixture object is usable.
   for i = 0; i < config.identities.length(); i = i + 1 {
     let identity = config.identities[i]
     let url = build_url(config, identity.object_id)
@@ -197,40 +201,47 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
   }
 
   let mut failure_count = 0
-  for actor_index = 0; actor_index < 2; actor_index = actor_index + 1 {
-    let target_index = 1 - actor_index
-    let actor = config.identities[actor_index]
-    let target = config.identities[target_index]
-    let url = build_url(config, target.object_id)
-    let headers = resolved_headers(config, actor)
-    let (status, body) = send_get(url, headers)
-    let leaks = marker_sources_in(body, baseline_markers[target_index])
-    let denied = config.denied_statuses.contains(status)
-    let passed = denied && leaks.length() == 0
-    let actual = if leaks.length() > 0 {
-      "HTTP \{status}; 响应包含受保护标记: " +
-      join_strings(leaks, ", ")
-    } else if denied {
-      "HTTP \{status}; 未发现受保护标记"
-    } else {
-      "HTTP \{status}; 状态码不属于拒绝集合"
-    }
-    let test_case = create_case(
-      "cross-\{actor.name}-to-\{target.name}",
-      actor,
-      target.object_id,
-      url,
-      status,
-      "HTTP \{status_codes_text(config.denied_statuses)} 且不含目标对象 ID/敏感值",
-      actual,
-      passed,
-      leaks,
-      display_headers(config, actor),
-    )
-    cases.push(test_case)
-    if !passed {
-      write_reproduction(output_dir, failure_count + 1, test_case)
-      failure_count = failure_count + 1
+  for actor_index = 0
+      actor_index < config.identities.length()
+      actor_index = actor_index + 1 {
+    for target_index = 0
+        target_index < config.identities.length()
+        target_index = target_index + 1 {
+      if actor_index != target_index {
+        let actor = config.identities[actor_index]
+        let target = config.identities[target_index]
+        let url = build_url(config, target.object_id)
+        let headers = resolved_headers(config, actor)
+        let (status, body) = send_get(url, headers)
+        let leaks = marker_sources_in(body, baseline_markers[target_index])
+        let denied = config.denied_statuses.contains(status)
+        let passed = denied && leaks.length() == 0
+        let actual = if leaks.length() > 0 {
+          "HTTP \{status}; 响应包含受保护标记: " +
+          join_strings(leaks, ", ")
+        } else if denied {
+          "HTTP \{status}; 未发现受保护标记"
+        } else {
+          "HTTP \{status}; 状态码不属于拒绝集合"
+        }
+        let test_case = create_case(
+          "cross-\{actor.name}-to-\{target.name}",
+          actor,
+          target.object_id,
+          url,
+          status,
+          "HTTP \{status_codes_text(config.denied_statuses)} 且不含目标对象 ID/敏感值",
+          actual,
+          passed,
+          leaks,
+          display_headers(config, actor),
+        )
+        cases.push(test_case)
+        if !passed {
+          write_reproduction(output_dir, failure_count + 1, test_case)
+          failure_count = failure_count + 1
+        }
+      }
     }
   }
 

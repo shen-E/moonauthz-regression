@@ -25,6 +25,15 @@
       },
       "baseline_statuses": [200],
       "sensitive_json_pointers": ["/email", "/private_note"]
+    },
+    {
+      "name": "C",
+      "object_id": "order-c-300",
+      "headers": {
+        "Authorization": "Bearer ${ENV:MOONAUTHZ_TOKEN_C}"
+      },
+      "baseline_statuses": [200],
+      "sensitive_json_pointers": ["/email", "/private_note"]
     }
   ],
   "denied_statuses": [403, 404]

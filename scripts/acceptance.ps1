@@ -5,8 +5,10 @@ $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 $script:RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $script:Moon = (Get-Command moon -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-$script:DemoTokenA = "demo-token-a"
-$script:DemoTokenB = "demo-token-b"
+$script:DemoTokens = @{ A = "demo-token-a"; B = "demo-token-b"; C = "demo-token-c" }
+$script:DemoConfig = Get-Content -Raw (Join-Path $script:RepoRoot "examples/demo.json") | ConvertFrom-Json
+$script:IdentityCount = @($script:DemoConfig.identities).Count
+$script:ExpectedCrossCases = $script:IdentityCount * ($script:IdentityCount - 1)
 $script:RunId = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
 $script:RelativeRunRoot = Join-Path "artifacts/acceptance" $script:RunId
 $script:RunRoot = Join-Path $script:RepoRoot $script:RelativeRunRoot
@@ -96,11 +98,11 @@ function Assert-ModeReport {
   if ($report.exit_code -ne $ExpectedExitCode) { throw "$Mode report declares an unexpected exit code." }
 
   $baselines = @($report.cases | Where-Object { $_.case -like "baseline-*" })
-  if ($baselines.Count -ne 2 -or @($baselines | Where-Object { -not $_.passed }).Count -ne 0) {
-    throw "$Mode run did not pass both owner baseline requests."
+  if ($baselines.Count -ne $script:IdentityCount -or @($baselines | Where-Object { -not $_.passed }).Count -ne 0) {
+    throw "$Mode run did not pass every owner baseline request."
   }
   $crossCases = @($report.cases | Where-Object { $_.case -like "cross-*" })
-  if ($crossCases.Count -ne 2) { throw "$Mode run did not produce both cross-identity cases." }
+  if ($crossCases.Count -ne $script:ExpectedCrossCases) { throw "$Mode run did not produce every cross-identity case." }
 
   foreach ($case in $crossCases) {
     if ($Mode -eq "safe") {
@@ -117,14 +119,16 @@ function Assert-ModeReport {
 
   foreach ($file in @(Get-ChildItem -LiteralPath $script:RunRoot -File -Recurse)) {
     $content = [System.IO.File]::ReadAllText($file.FullName)
-    if ($content.Contains($script:DemoTokenA) -or $content.Contains($script:DemoTokenB)) {
-      throw "A generated artifact contains a demo credential: $($file.FullName)"
+    foreach ($token in $script:DemoTokens.Values) {
+      if ($content.Contains($token)) {
+        throw "A generated artifact contains a demo credential: $($file.FullName)"
+      }
     }
   }
 
   if ($Mode -eq "vulnerable") {
     $repros = @(Get-ChildItem -LiteralPath $outputDir -Filter "*.http" -File)
-    if ($repros.Count -ne 2) { throw "Vulnerable mode should produce two sanitized .http reproductions." }
+    if ($repros.Count -ne $script:ExpectedCrossCases) { throw "Vulnerable mode should produce a sanitized .http reproduction for each failing identity pair." }
     $placeholderPrefix = '$' + '{ENV:MOONAUTHZ_TOKEN_'
     foreach ($repro in $repros) {
       $content = [System.IO.File]::ReadAllText($repro.FullName)
@@ -134,7 +138,7 @@ function Assert-ModeReport {
   elseif (@(Get-ChildItem -LiteralPath $outputDir -Filter "*.http" -File).Count -ne 0) {
     throw "Safe mode unexpectedly produced failure reproductions."
   }
-  Write-Host ("{0}: expected behavior verified (exit {1}); baselines=2, cross-cases=2." -f $Mode, $ExpectedExitCode)
+  Write-Host ("{0}: expected behavior verified (exit {1}); baselines={2}, cross-cases={3}." -f $Mode, $ExpectedExitCode, $script:IdentityCount, $script:ExpectedCrossCases)
 }
 
 function Invoke-Mode {
@@ -151,15 +155,20 @@ function Invoke-Mode {
   Assert-ModeReport -Mode $Mode -ExpectedExitCode $ExpectedExitCode
 }
 
-$previousTokenA = $env:MOONAUTHZ_TOKEN_A
-$previousTokenB = $env:MOONAUTHZ_TOKEN_B
+$previousTokens = @{}
 try {
-  $env:MOONAUTHZ_TOKEN_A = $script:DemoTokenA
-  $env:MOONAUTHZ_TOKEN_B = $script:DemoTokenB
+  foreach ($identity in $script:DemoConfig.identities) {
+    $name = $identity.name
+    if (-not $script:DemoTokens.ContainsKey($name)) { throw "No demo token is configured for identity $name." }
+    $envName = "MOONAUTHZ_TOKEN_$name"
+    $previousTokens[$envName] = [Environment]::GetEnvironmentVariable($envName, "Process")
+    [Environment]::SetEnvironmentVariable($envName, $script:DemoTokens[$name], "Process")
+  }
   Write-Host "MoonAuthz Regression acceptance run: $script:RunId"
   Write-Host "Artifacts: $script:RunRoot"
   $null = Invoke-Moon -Arguments @("update") -LogPath (Join-Path $script:LogsRoot "moon-update.log") -ExpectedExitCode 0
   $null = Invoke-Moon -Arguments @("check", "--target", "native") -LogPath (Join-Path $script:LogsRoot "moon-check.log") -ExpectedExitCode 0
+  $null = Invoke-Moon -Arguments @("test", "--target", "native") -LogPath (Join-Path $script:LogsRoot "moon-test.log") -ExpectedExitCode 0
   Invoke-Mode -Mode "safe" -ExpectedExitCode 0
   Invoke-Mode -Mode "vulnerable" -ExpectedExitCode 1
 
@@ -167,19 +176,21 @@ try {
 # Acceptance run $script:RunId
 
 - moon check --target native: passed.
-- Safe API: both owner baselines passed; both cross-identity reads were denied; CLI exit code 0.
-- Vulnerable API: both owner baselines passed; both cross-identity reads exposed protected markers; CLI exit code 1.
+- moon test --target native: passed.
+- Safe API: all $script:IdentityCount owner baselines passed; all $script:ExpectedCrossCases cross-identity reads were denied; CLI exit code 0.
+- Vulnerable API: all owner baselines passed; all cross-identity reads exposed protected markers; CLI exit code 1.
 - Credential scan: passed for generated reports, logs, and reproductions.
 - Safe report: safe/report.json
 - Vulnerable report: vulnerable/report.json
-- Sanitized reproductions: vulnerable/failure-1.http, vulnerable/failure-2.http
+- Sanitized reproductions: vulnerable/failure-1.http through vulnerable/failure-$($script:ExpectedCrossCases).http
 "@
   Write-Utf8File -Path (Join-Path $script:RunRoot "SUMMARY.md") -Content $summary
   Write-Host ([Environment]::NewLine + "Acceptance passed. See $(Join-Path $script:RunRoot 'SUMMARY.md')")
 }
 finally {
-  if ($null -eq $previousTokenA) { Remove-Item Env:MOONAUTHZ_TOKEN_A -ErrorAction SilentlyContinue } else { $env:MOONAUTHZ_TOKEN_A = $previousTokenA }
-  if ($null -eq $previousTokenB) { Remove-Item Env:MOONAUTHZ_TOKEN_B -ErrorAction SilentlyContinue } else { $env:MOONAUTHZ_TOKEN_B = $previousTokenB }
+  foreach ($envName in $previousTokens.Keys) {
+    [Environment]::SetEnvironmentVariable($envName, $previousTokens[$envName], "Process")
+  }
   Pop-Location
 }
 

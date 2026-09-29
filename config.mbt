@@ -267,12 +267,17 @@ fn parse_config(root : Json) -> AppConfig raise CliError {
   let raw_identities = required_field(root, "identities")
   let identities = match raw_identities {
     Json::Array(items) => {
-      if items.length() != 2 {
-        raise CliError("首版必须恰好配置两组测试身份")
+      if items.length() < 2 || items.length() > 10 {
+        raise CliError(
+          "必须配置 2 到 10 组测试身份，以限制交叉请求数量",
+        )
       }
       let out : Array[Identity] = []
       for item in items {
         let name = required_string(item, "name")
+        if name == "" {
+          raise CliError("身份名称不能为空")
+        }
         let object_id = required_string(item, "object_id")
         if object_id == "" {
           raise CliError("object_id 不能为空: " + name)
@@ -298,8 +303,15 @@ fn parse_config(root : Json) -> AppConfig raise CliError {
           sensitive_pointers,
         })
       }
-      if out[0].name == out[1].name || out[0].object_id == out[1].object_id {
-        raise CliError("两组身份名称和对象 ID 必须各不相同")
+      for i = 0; i < out.length(); i = i + 1 {
+        for j = 0; j < i; j = j + 1 {
+          if out[i].name == out[j].name {
+            raise CliError("身份名称必须各不相同: " + out[i].name)
+          }
+          if out[i].object_id == out[j].object_id {
+            raise CliError("对象 ID 必须各不相同: " + out[i].object_id)
+          }
+        }
       }
       out
     }

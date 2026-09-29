@@ -21,6 +21,10 @@ fn order_response(object_id : String) -> String? {
       Some(
         "{\"id\":\"order-b-200\",\"owner\":\"B\",\"email\":\"bob-private@example.test\",\"private_note\":\"B-only refund note\"}",
       )
+    "order-c-300" =>
+      Some(
+        "{\"id\":\"order-c-300\",\"owner\":\"C\",\"email\":\"carol-private@example.test\",\"private_note\":\"C-only invoice note\"}",
+      )
     _ => None
   }
 }
@@ -30,6 +34,7 @@ fn order_owner(object_id : String) -> String? {
   match object_id {
     "order-a-100" => Some("A")
     "order-b-200" => Some("B")
+    "order-c-300" => Some("C")
     _ => None
   }
 }
@@ -67,6 +72,7 @@ async fn serve_request(
     request.headers.get(@http.CaseInsensitiveString("Authorization")) {
     Some("Bearer demo-token-a") => Some("A")
     Some("Bearer demo-token-b") => Some("B")
+    Some("Bearer demo-token-c") => Some("C")
     _ => None
   }
   match actor {
