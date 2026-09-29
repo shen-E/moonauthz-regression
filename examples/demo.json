@@ -1,5 +1,7 @@
 {
   "base_url": "http://127.0.0.1:8095",
+  "leak_detection": "json_pointer",
+  "object_id_json_pointer": "/id",
   "request": {
     "method": "GET",
     "path": "/orders/{{object_id}}",

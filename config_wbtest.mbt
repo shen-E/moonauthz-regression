@@ -83,3 +83,66 @@ test "config rejects duplicate object IDs outside the first pair" {
     ),
   )
 }
+
+///|
+test "config rejects multiple object ID placeholders" {
+  let root = test_config(["A", "B"], ["id-a", "id-b"])
+  match root {
+    Json::Object(fields) => {
+      fields["request"] = Json::object({
+        "path": Json::string("/objects/{{object_id}}?copy={{object_id}}"),
+      })
+      assert_true(config_is_rejected(Json::object(fields)))
+    }
+    _ => fail("test config must be an object")
+  }
+}
+
+///|
+test "config rejects control characters in the request target" {
+  let root = test_config(["A", "B"], ["id-a", "id-b"])
+  match root {
+    Json::Object(fields) => {
+      fields["request"] = Json::object({
+        "path": Json::string("/objects/{{object_id}}\r\nX-Injected: yes"),
+      })
+      assert_true(config_is_rejected(Json::object(fields)))
+    }
+    _ => fail("test config must be an object")
+  }
+}
+
+///|
+test "config rejects malformed JSON Pointer escapes" {
+  assert_true(is_json_pointer("/profile/name"))
+  assert_true(is_json_pointer("/profile/a~1b/~0key"))
+  assert_false(is_json_pointer("/profile/bad~2escape"))
+}
+
+///|
+test "object IDs are encoded as one path or query component" {
+  let path_config = parse_config(test_config(["A", "B"], ["id-a", "id-b"]))
+  assert_eq(
+    build_url(path_config, "a/b ?#%&"),
+    "http://127.0.0.1:8095/objects/a%2Fb%20%3F%23%25%26",
+  )
+  assert_eq(
+    build_url(path_config, "用户"),
+    "http://127.0.0.1:8095/objects/%E7%94%A8%E6%88%B7",
+  )
+
+  let query_root = test_config(["A", "B"], ["id-a", "id-b"])
+  match query_root {
+    Json::Object(fields) => {
+      fields["request"] = Json::object({
+        "path": Json::string("/objects?object={{object_id}}"),
+      })
+      let query_config = parse_config(Json::object(fields))
+      assert_eq(
+        build_url(query_config, "a&role=admin"),
+        "http://127.0.0.1:8095/objects?object=a%26role%3Dadmin",
+      )
+    }
+    _ => fail("test config must be an object")
+  }
+}

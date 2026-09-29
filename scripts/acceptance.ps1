@@ -155,6 +155,74 @@ function Invoke-Mode {
   Assert-ModeReport -Mode $Mode -ExpectedExitCode $ExpectedExitCode
 }
 
+function Copy-DemoConfig {
+  return ($script:DemoConfig | ConvertTo-Json -Depth 20 | ConvertFrom-Json)
+}
+
+function Invoke-BoundaryConfig {
+  param([string]$Name, [object]$Config, [int]$ExpectedExitCode)
+  $relativeConfig = Join-Path (Join-Path $script:RelativeRunRoot "configs") "$Name.json"
+  $configPath = Join-Path $script:RepoRoot $relativeConfig
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $configPath) | Out-Null
+  Write-Utf8File -Path $configPath -Content ($Config | ConvertTo-Json -Depth 20)
+  $relativeOutputDir = Join-Path (Join-Path $script:RelativeRunRoot "boundary") $Name
+  $outputDir = Join-Path $script:RepoRoot $relativeOutputDir
+  New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+  $logPath = Join-Path $script:LogsRoot "boundary-$Name.log"
+  $null = Invoke-Moon -Arguments @("run", "--target", "native", "cmd/main", "--", "run", $relativeConfig, "--out", $relativeOutputDir) -LogPath $logPath -ExpectedExitCode $ExpectedExitCode
+  $reportPath = Join-Path $outputDir "report.json"
+  $report = $null
+  if (Test-Path $reportPath) { $report = Get-Content -Raw $reportPath | ConvertFrom-Json }
+  return [pscustomobject]@{ OutputDir = $outputDir; LogPath = $logPath; Report = $report }
+}
+
+function Invoke-BoundaryChecks {
+  $server = Start-DemoServer -Mode safe
+  $missingTokenName = "MOONAUTHZ_TOKEN_MISSING"
+  $previousMissingToken = [Environment]::GetEnvironmentVariable($missingTokenName, "Process")
+  try {
+    $missingCredential = Copy-DemoConfig
+    $missingCredential.identities[0].headers.Authorization = 'Bearer ${ENV:MOONAUTHZ_TOKEN_MISSING}'
+    [Environment]::SetEnvironmentVariable($missingTokenName, $null, "Process")
+    $missingResult = Invoke-BoundaryConfig -Name "missing-credential" -Config $missingCredential -ExpectedExitCode 2
+    if (-not (Select-String -LiteralPath $missingResult.LogPath -Pattern "环境变量未设置: $missingTokenName" -Quiet)) {
+      throw "Missing credentials did not produce the expected execution error."
+    }
+
+    $badBaselineStatus = Copy-DemoConfig
+    $badBaselineStatus.identities[0].baseline_statuses = @(201)
+    $baselineResult = Invoke-BoundaryConfig -Name "baseline-status-mismatch" -Config $badBaselineStatus -ExpectedExitCode 2
+    if ($null -eq $baselineResult.Report -or $baselineResult.Report.exit_code -ne 2 -or @($baselineResult.Report.cases | Where-Object { $_.case -like "cross-*" }).Count -ne 0) {
+      throw "An invalid baseline status must end the run with exit 2 before cross-identity checks."
+    }
+
+    $missingPointer = Copy-DemoConfig
+    $missingPointer.identities[0].sensitive_json_pointers = @("/missing_field")
+    $pointerResult = Invoke-BoundaryConfig -Name "missing-sensitive-field" -Config $missingPointer -ExpectedExitCode 2
+    $firstBaseline = @($pointerResult.Report.cases | Where-Object { $_.case -eq "baseline-A" })[0]
+    if ($null -eq $firstBaseline -or $firstBaseline.passed -or $pointerResult.Report.exit_code -ne 2) {
+      throw "A missing baseline marker must be reported as an execution error."
+    }
+
+    $badDeniedStatus = Copy-DemoConfig
+    $badDeniedStatus.denied_statuses = @(401)
+    $deniedResult = Invoke-BoundaryConfig -Name "denied-status-mismatch" -Config $badDeniedStatus -ExpectedExitCode 1
+    $crossCases = @($deniedResult.Report.cases | Where-Object { $_.case -like "cross-*" })
+    if ($deniedResult.Report.exit_code -ne 1 -or $crossCases.Count -ne $script:ExpectedCrossCases -or @($crossCases | Where-Object { $_.passed -or @($_.leaks).Count -ne 0 }).Count -ne 0) {
+      throw "A status outside the configured denied set must be reported as authorization test failures (exit 1), with no false leak marker."
+    }
+    $reproductions = @(Get-ChildItem -LiteralPath $deniedResult.OutputDir -Filter "*.http" -File)
+    if ($reproductions.Count -ne $script:ExpectedCrossCases) {
+      throw "A denied-status mismatch must save one sanitized reproduction per failed cross case."
+    }
+  }
+  finally {
+    [Environment]::SetEnvironmentVariable($missingTokenName, $previousMissingToken, "Process")
+    Stop-DemoServer -Process $server
+  }
+  Write-Host "Execution-boundary checks passed: missing credentials, invalid baselines, missing fields, and denied-status mismatch."
+}
+
 $previousTokens = @{}
 try {
   foreach ($identity in $script:DemoConfig.identities) {
@@ -171,6 +239,15 @@ try {
   $null = Invoke-Moon -Arguments @("test", "--target", "native") -LogPath (Join-Path $script:LogsRoot "moon-test.log") -ExpectedExitCode 0
   Invoke-Mode -Mode "safe" -ExpectedExitCode 0
   Invoke-Mode -Mode "vulnerable" -ExpectedExitCode 1
+  Invoke-BoundaryChecks
+  foreach ($file in @(Get-ChildItem -LiteralPath $script:RunRoot -File -Recurse)) {
+    $content = [System.IO.File]::ReadAllText($file.FullName)
+    foreach ($token in $script:DemoTokens.Values) {
+      if ($content.Contains($token)) {
+        throw "A generated artifact contains a demo credential: $($file.FullName)"
+      }
+    }
+  }
 
   $summary = @"
 # Acceptance run $script:RunId
@@ -179,6 +256,7 @@ try {
 - moon test --target native: passed.
 - Safe API: all $script:IdentityCount owner baselines passed; all $script:ExpectedCrossCases cross-identity reads were denied; CLI exit code 0.
 - Vulnerable API: all owner baselines passed; all cross-identity reads exposed protected markers; CLI exit code 1.
+- Execution boundaries: missing credentials, baseline status mismatch, missing sensitive field, and denied-status mismatch returned the expected exit codes and report outcomes.
 - Credential scan: passed for generated reports, logs, and reproductions.
 - Safe report: safe/report.json
 - Vulnerable report: vulnerable/report.json

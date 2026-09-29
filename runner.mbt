@@ -17,14 +17,57 @@ async fn send_get(url : String, headers : @http.Headers) -> (Int, String) {
 }
 
 ///|
-fn marker_sources_in(body : String, markers : Array[Marker]) -> Array[String] {
+fn marker_sources_in(
+  body : String,
+  markers : Array[Marker],
+  leak_detection : String,
+) -> Array[String] {
   let found : Array[String] = []
+  if leak_detection == "substring" {
+    for marker in markers {
+      if marker.value != "" && body.contains(marker.value) {
+        found.push(marker.source)
+      }
+    }
+    return found
+  }
+  let json = @json.parse(body) catch { _ => return found }
   for marker in markers {
-    if marker.value != "" && body.contains(marker.value) {
-      found.push(marker.source)
+    match (marker.pointer, marker.json_value) {
+      (Some(pointer), Some(baseline_value)) =>
+        match json_pointer(json, pointer) {
+          Some(value) if Json::equal(value, baseline_value) =>
+            found.push(marker.source)
+          _ => ()
+        }
+      _ => ()
     }
   }
   found
+}
+
+///|
+fn url_origin(url : String) -> String? {
+  guard url.find("://") is Some(scheme_end) else { return None }
+  let authority_start = scheme_end + 3
+  let remainder = url[authority_start:]
+  let authority_end = match remainder.find("/") {
+    Some(index) => index
+    None => remainder.length()
+  }
+  if authority_end == 0 {
+    None
+  } else {
+    Some(url[:authority_start + authority_end].to_owned())
+  }
+}
+
+///|
+fn ensure_same_origin(config : AppConfig, url : String) -> Unit raise CliError {
+  match (url_origin(config.base_url), url_origin(url)) {
+    (Some(expected), Some(actual)) if expected == actual => ()
+    _ => raise CliError("最终请求 URL 的 origin 与 base_url 不一致")
+  }
 }
 
 ///|
@@ -150,6 +193,7 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
   for i = 0; i < config.identities.length(); i = i + 1 {
     let identity = config.identities[i]
     let url = build_url(config, identity.object_id)
+    ensure_same_origin(config, url)
     let headers = resolved_headers(config, identity)
     let (status, body) = send_get(url, headers)
     let status_ok = identity.baseline_statuses.contains(status)
@@ -162,7 +206,7 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
       )
     } else {
       try {
-        baseline_markers[i] = extract_markers(identity, body)
+        baseline_markers[i] = extract_markers(config, identity, body)
         baseline_ok[i] = true
       } catch {
         CliError(message) => {
@@ -211,9 +255,14 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
         let actor = config.identities[actor_index]
         let target = config.identities[target_index]
         let url = build_url(config, target.object_id)
+        ensure_same_origin(config, url)
         let headers = resolved_headers(config, actor)
         let (status, body) = send_get(url, headers)
-        let leaks = marker_sources_in(body, baseline_markers[target_index])
+        let leaks = marker_sources_in(
+          body,
+          baseline_markers[target_index],
+          config.leak_detection,
+        )
         let denied = config.denied_statuses.contains(status)
         let passed = denied && leaks.length() == 0
         let actual = if leaks.length() > 0 {

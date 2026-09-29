@@ -16,6 +16,8 @@ priv struct Identity {
 priv struct AppConfig {
   base_url : String
   path_template : String
+  object_id_pointer : String
+  leak_detection : String
   common_headers : Map[String, String]
   identities : Array[Identity]
   denied_statuses : Array[Int]
@@ -25,6 +27,8 @@ priv struct AppConfig {
 priv struct Marker {
   source : String
   value : String
+  pointer : String?
+  json_value : Json?
 }
 
 ///|
@@ -240,6 +244,13 @@ fn parse_config(root : Json) -> AppConfig raise CliError {
   if base_url.contains("?") || base_url.contains("#") {
     raise CliError("base_url 不能包含 query 或 fragment")
   }
+  if base_url.contains("\\") ||
+    base_url.contains(" ") ||
+    base_url.contains("\r") ||
+    base_url.contains("\n") ||
+    base_url.contains("\t") {
+    raise CliError("base_url 不能包含反斜杠、空格或控制字符")
+  }
   let mut normalized_base = base_url
   while normalized_base.has_suffix("/") {
     normalized_base = normalized_base[:normalized_base.length() - 1].to_owned()
@@ -258,6 +269,26 @@ fn parse_config(root : Json) -> AppConfig raise CliError {
   }
   if !path_template.contains("{{object_id}}") {
     raise CliError("request.path 必须包含 {{object_id}}")
+  }
+  if count_occurrences(path_template, "{{object_id}}") != 1 {
+    raise CliError("request.path 必须且只能包含一个 {{object_id}}")
+  }
+  if path_template.contains("#") ||
+    path_template.contains("\\") ||
+    path_template.contains("\r") ||
+    path_template.contains("\n") ||
+    path_template.contains("\t") {
+    raise CliError(
+      "request.path 不能包含 fragment、反斜杠或控制字符",
+    )
+  }
+  let leak_detection = optional_string(root, "leak_detection", "json_pointer")
+  if leak_detection != "json_pointer" && leak_detection != "substring" {
+    raise CliError("leak_detection 只能是 json_pointer 或 substring")
+  }
+  let object_id_pointer = optional_string(root, "object_id_json_pointer", "/id")
+  if leak_detection == "json_pointer" && !is_json_pointer(object_id_pointer) {
+    raise CliError("object_id_json_pointer 必须是有效 JSON Pointer")
   }
   let common_headers = string_map(
     object_field(request, "headers"),
@@ -295,6 +326,13 @@ fn parse_config(root : Json) -> AppConfig raise CliError {
           object_field(item, "sensitive_json_pointers"),
           "identities." + name + ".sensitive_json_pointers",
         )
+        for pointer in sensitive_pointers {
+          if !is_json_pointer(pointer) {
+            raise CliError(
+              "敏感字段路径必须是有效 JSON Pointer: " + pointer,
+            )
+          }
+        }
         out.push({
           name,
           object_id,
@@ -325,10 +363,47 @@ fn parse_config(root : Json) -> AppConfig raise CliError {
   {
     base_url: normalized_base,
     path_template,
+    object_id_pointer,
+    leak_detection,
     common_headers,
     identities,
     denied_statuses,
   }
+}
+
+///|
+fn count_occurrences(input : String, pattern : String) -> Int {
+  let mut remaining = input
+  let mut count = 0
+  while remaining.find(pattern) is Some(index) {
+    count = count + 1
+    remaining = remaining[index + pattern.length():].to_owned()
+  }
+  count
+}
+
+///|
+fn is_json_pointer(pointer : String) -> Bool {
+  if pointer == "" {
+    return true
+  }
+  if !pointer.has_prefix("/") {
+    return false
+  }
+  for segment in pointer.split("/") {
+    let mut remaining = segment.to_owned()
+    while remaining.find("~") is Some(index) {
+      if index + 1 >= remaining.length() {
+        return false
+      }
+      let escaped = remaining[index + 1:index + 2].to_owned()
+      if escaped != "0" && escaped != "1" {
+        return false
+      }
+      remaining = remaining[index + 2:].to_owned()
+    }
+  }
+  true
 }
 
 ///|
@@ -362,8 +437,8 @@ fn resolve_env(template : String) -> String raise CliError {
       raise CliError("环境变量名不能为空")
     }
     let value = match @env.get_env_var(name) {
-      Some(value) => value
-      None => raise CliError("环境变量未设置: " + name)
+      Some(value) if value != "" => value
+      _ => raise CliError("环境变量未设置: " + name)
     }
     out = out + value
     remaining = after_prefix[end + 1:].to_owned()
@@ -410,30 +485,106 @@ fn display_headers(
 }
 
 ///|
+fn url_component_encode(value : String) -> String {
+  let bytes = @utf8.encode(value)
+  let mut out = ""
+  let hex = @utf8.encode("0123456789ABCDEF")
+  for byte in bytes {
+    let value = byte.to_int()
+    let unreserved = (value >= 65 && value <= 90) ||
+      (value >= 97 && value <= 122) ||
+      (value >= 48 && value <= 57) ||
+      value == 45 ||
+      value == 46 ||
+      value == 95 ||
+      value == 126
+    if unreserved {
+      out = out + byte.to_char().to_string()
+    } else {
+      let high = value / 16
+      let low = value % 16
+      out = out +
+        "%" +
+        hex[high].to_char().to_string() +
+        hex[low].to_char().to_string()
+    }
+  }
+  out
+}
+
+///|
 fn build_url(config : AppConfig, object_id : String) -> String {
+  let encoded_id = url_component_encode(object_id)
   config.base_url +
-  replace_all(config.path_template, "{{object_id}}", object_id)
+  replace_all(config.path_template, "{{object_id}}", encoded_id)
 }
 
 ///|
 fn extract_markers(
+  config : AppConfig,
   identity : Identity,
   body : String,
 ) -> Array[Marker] raise CliError {
-  let markers : Array[Marker] = [
-    { source: "object_id", value: identity.object_id, },
-  ]
-  if identity.sensitive_pointers.length() == 0 {
-    return markers
+  let markers : Array[Marker] = []
+  let json = if config.leak_detection == "json_pointer" ||
+    identity.sensitive_pointers.length() > 0 {
+    Some(
+      @json.parse(body) catch {
+        _ =>
+          raise CliError(
+            "自有对象基线响应不是有效 JSON: " + identity.name,
+          )
+      },
+    )
+  } else {
+    None
   }
-  let json = @json.parse(body) catch {
-    _ =>
-      raise CliError(
-        "自有对象基线响应不是有效 JSON: " + identity.name,
-      )
+  if config.leak_detection == "json_pointer" {
+    let root = match json {
+      Some(value) => value
+      None => raise CliError("结构化泄露检测需要 JSON 基线响应")
+    }
+    match json_pointer(root, config.object_id_pointer) {
+      None =>
+        raise CliError(
+          "基线响应缺少对象 ID JSON 字段 " +
+          config.object_id_pointer +
+          " (身份 " +
+          identity.name +
+          ")",
+        )
+      Some(value) =>
+        match json_marker(value) {
+          Some(marker) if marker == identity.object_id =>
+            markers.push({
+              source: "object_id",
+              value: marker,
+              pointer: Some(config.object_id_pointer),
+              json_value: Some(value),
+            })
+          _ =>
+            raise CliError(
+              "基线对象 ID 与配置不匹配: " + identity.name,
+            )
+        }
+    }
+  } else {
+    markers.push({
+      source: "object_id",
+      value: identity.object_id,
+      pointer: None,
+      json_value: None,
+    })
   }
   for pointer in identity.sensitive_pointers {
-    match json_pointer(json, pointer) {
+    let root = match json {
+      Some(value) => value
+      None =>
+        raise CliError(
+          "自有对象基线响应不是有效 JSON: " + identity.name,
+        )
+    }
+    match json_pointer(root, pointer) {
       None =>
         raise CliError(
           "基线响应缺少敏感 JSON 字段 " +
@@ -444,7 +595,13 @@ fn extract_markers(
         )
       Some(value) =>
         match json_marker(value) {
-          Some(marker) => markers.push({ source: pointer, value: marker, })
+          Some(marker) =>
+            markers.push({
+              source: pointer,
+              value: marker,
+              pointer: Some(pointer),
+              json_value: Some(value),
+            })
           None =>
             raise CliError(
               "基线敏感字段没有可检查的值: " + pointer,
