@@ -7,6 +7,7 @@ $script:RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $script:Moon = (Get-Command moon -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $script:DemoTokens = @{ A = "demo-token-a"; B = "demo-token-b"; C = "demo-token-c" }
 $script:DemoConfig = Get-Content -Raw (Join-Path $script:RepoRoot "examples/demo.json") | ConvertFrom-Json
+$script:WriteDemoConfig = Get-Content -Raw (Join-Path $script:RepoRoot "examples/write-demo.json") | ConvertFrom-Json
 $script:IdentityCount = @($script:DemoConfig.identities).Count
 $script:ExpectedCrossCases = $script:IdentityCount * ($script:IdentityCount - 1)
 $script:RunId = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
@@ -155,8 +156,79 @@ function Invoke-Mode {
   Assert-ModeReport -Mode $Mode -ExpectedExitCode $ExpectedExitCode
 }
 
+function Assert-WriteModeReport {
+  param([ValidateSet("safe", "vulnerable")][string]$Mode, [ValidateSet("POST", "PUT", "PATCH")][string]$Verb, [int]$ExpectedExitCode)
+  $relativeOutputDir = Join-Path (Join-Path $script:RelativeRunRoot "write-$Mode") $Verb
+  $outputDir = Join-Path $script:RepoRoot $relativeOutputDir
+  $reportPath = Join-Path $outputDir "report.json"
+  if (-not (Test-Path $reportPath)) { throw "The write-$Mode run did not produce $reportPath." }
+  $report = Get-Content -Raw $reportPath | ConvertFrom-Json
+  if ($report.exit_code -ne $ExpectedExitCode) { throw "write-$Mode report declares an unexpected exit code." }
+  $baselines = @($report.cases | Where-Object { $_.case -like "baseline-*" })
+  if ($baselines.Count -ne $script:IdentityCount -or @($baselines | Where-Object { -not $_.passed }).Count -ne 0) {
+    throw "write-$Mode run did not pass every owner baseline request."
+  }
+  $crossCases = @($report.cases | Where-Object { $_.case -like "cross-*" })
+  if ($crossCases.Count -ne $script:ExpectedCrossCases) { throw "write-$Mode run did not produce every cross-identity case." }
+  foreach ($case in $crossCases) {
+    if ($case.method -ne $Verb -or $case.cleanup_status -ne 204 -or @($case.state_changes | Where-Object { $_ -like "cleanup:*" }).Count -ne 0) {
+      throw "write-$Mode did not clean and restore $($case.case)."
+    }
+    if ($Mode -eq "safe") {
+      if (-not $case.passed -or @($case.leaks).Count -ne 0 -or @($case.state_changes).Count -ne 0 -or $case.status -notin @(403, 404)) {
+        throw "Safe mode did not deny and preserve state for $($case.case)."
+      }
+    }
+    else {
+      if ($case.passed -or $case.leaks -notcontains "object_id" -or $case.state_changes -notcontains "/private_note" -or $case.status -in @(403, 404)) {
+        throw "Vulnerable mode did not detect the cross-user write and verify the mutation for $($case.case)."
+      }
+    }
+  }
+  if ($Mode -eq "vulnerable") {
+    $repros = @(Get-ChildItem -LiteralPath $outputDir -Filter "*.http" -File)
+    if ($repros.Count -ne $script:ExpectedCrossCases) { throw "Vulnerable write mode should save one reproduction per failed case." }
+    foreach ($repro in $repros) {
+      $content = [System.IO.File]::ReadAllText($repro.FullName)
+      if (-not $content.Contains("$Verb ") -or -not $content.Contains("private_note")) {
+        throw "A write reproduction must include the method and JSON test body."
+      }
+    }
+  }
+  elseif (@(Get-ChildItem -LiteralPath $outputDir -Filter "*.http" -File).Count -ne 0) {
+    throw "Safe write mode unexpectedly produced failure reproductions."
+  }
+  Write-Host ("write-{0}/{1}: expected behavior verified (exit {2}); baselines={3}, cross-cases={4}, state restored." -f $Mode, $Verb, $ExpectedExitCode, $script:IdentityCount, $script:ExpectedCrossCases)
+}
+
+function Invoke-WriteMode {
+  param([ValidateSet("safe", "vulnerable")][string]$Mode, [int]$ExpectedExitCode)
+  $server = Start-DemoServer -Mode $Mode
+  try {
+    foreach ($verb in @("POST", "PUT", "PATCH")) {
+      $config = Copy-WriteDemoConfig
+      $config.request.method = $verb
+      $relativeConfig = Join-Path (Join-Path $script:RelativeRunRoot "configs") "write-$Mode-$verb.json"
+      $configPath = Join-Path $script:RepoRoot $relativeConfig
+      New-Item -ItemType Directory -Force -Path (Split-Path -Parent $configPath) | Out-Null
+      Write-Utf8File -Path $configPath -Content ($config | ConvertTo-Json -Depth 20)
+      $relativeOutputDir = Join-Path (Join-Path $script:RelativeRunRoot "write-$Mode") $verb
+      $outputDir = Join-Path $script:RepoRoot $relativeOutputDir
+      New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+      $logPath = Join-Path $script:LogsRoot "write-$Mode-$verb-cli.log"
+      $null = Invoke-Moon -Arguments @("run", "--target", "native", "cmd/main", "--", "run", $relativeConfig, "--out", $relativeOutputDir) -LogPath $logPath -ExpectedExitCode $ExpectedExitCode
+      Assert-WriteModeReport -Mode $Mode -Verb $verb -ExpectedExitCode $ExpectedExitCode
+    }
+  }
+  finally { Stop-DemoServer -Process $server }
+}
+
 function Copy-DemoConfig {
   return ($script:DemoConfig | ConvertTo-Json -Depth 20 | ConvertFrom-Json)
+}
+
+function Copy-WriteDemoConfig {
+  return ($script:WriteDemoConfig | ConvertTo-Json -Depth 20 | ConvertFrom-Json)
 }
 
 function Invoke-BoundaryConfig {
@@ -215,12 +287,29 @@ function Invoke-BoundaryChecks {
     if ($reproductions.Count -ne $script:ExpectedCrossCases) {
       throw "A denied-status mismatch must save one sanitized reproduction per failed cross case."
     }
+
+    $badCleanupStatus = Copy-WriteDemoConfig
+    $badCleanupStatus.cleanup.success_statuses = @(401)
+    $cleanupResult = Invoke-BoundaryConfig -Name "cleanup-status-mismatch" -Config $badCleanupStatus -ExpectedExitCode 2
+    $cleanupCases = @($cleanupResult.Report.cases | Where-Object { $_.case -like "cross-*" })
+    if ($cleanupResult.Report.exit_code -ne 2 -or $cleanupCases.Count -ne $script:ExpectedCrossCases -or @($cleanupCases | Where-Object { $_.passed }).Count -ne 0 -or @($cleanupResult.Report.execution_errors).Count -ne $script:ExpectedCrossCases) {
+      throw "A cleanup status mismatch must be reported as exit 2 and leave every case visibly failed."
+    }
+
+    $badCleanupState = Copy-WriteDemoConfig
+    $badCleanupState.request.protected_json_pointers = @("/private_note", "/email")
+    $badCleanupState.cleanup.body = '{"private_note":{{baseline:/email}},"email":{{baseline:/private_note}}}'
+    $cleanupStateResult = Invoke-BoundaryConfig -Name "cleanup-state-mismatch" -Config $badCleanupState -ExpectedExitCode 2
+    $cleanupStateCases = @($cleanupStateResult.Report.cases | Where-Object { $_.case -like "cross-*" })
+    if ($cleanupStateResult.Report.exit_code -ne 2 -or $cleanupStateCases.Count -ne $script:ExpectedCrossCases -or @($cleanupStateCases | Where-Object { $_.state_changes -notcontains "cleanup:/private_note" }).Count -ne 0) {
+      throw "A cleanup body that leaves protected state changed must be caught by the owner read-back."
+    }
   }
   finally {
     [Environment]::SetEnvironmentVariable($missingTokenName, $previousMissingToken, "Process")
     Stop-DemoServer -Process $server
   }
-  Write-Host "Execution-boundary checks passed: missing credentials, invalid baselines, missing fields, and denied-status mismatch."
+  Write-Host "Execution-boundary checks passed: missing credentials, invalid baselines, missing fields, denied-status mismatch, cleanup-status mismatch, and cleanup-state mismatch."
 }
 
 $previousTokens = @{}
@@ -239,6 +328,8 @@ try {
   $null = Invoke-Moon -Arguments @("test", "--target", "native") -LogPath (Join-Path $script:LogsRoot "moon-test.log") -ExpectedExitCode 0
   Invoke-Mode -Mode "safe" -ExpectedExitCode 0
   Invoke-Mode -Mode "vulnerable" -ExpectedExitCode 1
+  Invoke-WriteMode -Mode "safe" -ExpectedExitCode 0
+  Invoke-WriteMode -Mode "vulnerable" -ExpectedExitCode 1
   Invoke-BoundaryChecks
   foreach ($file in @(Get-ChildItem -LiteralPath $script:RunRoot -File -Recurse)) {
     $content = [System.IO.File]::ReadAllText($file.FullName)
@@ -256,11 +347,14 @@ try {
 - moon test --target native: passed.
 - Safe API: all $script:IdentityCount owner baselines passed; all $script:ExpectedCrossCases cross-identity reads were denied; CLI exit code 0.
 - Vulnerable API: all owner baselines passed; all cross-identity reads exposed protected markers; CLI exit code 1.
-- Execution boundaries: missing credentials, baseline status mismatch, missing sensitive field, and denied-status mismatch returned the expected exit codes and report outcomes.
+- Safe write API: all cross-identity POST, PUT, and PATCH requests were denied; protected fields stayed unchanged and cleanup verified successfully; CLI exit code 0.
+- Vulnerable write API: all cross-identity POST, PUT, and PATCH requests changed protected state; cleanup restored every object and the CLI reported exit code 1.
+- Execution boundaries: missing credentials, invalid baselines, missing fields, denied-status mismatch, cleanup-status mismatch, and post-cleanup state mismatch returned their expected exit codes.
 - Credential scan: passed for generated reports, logs, and reproductions.
 - Safe report: safe/report.json
 - Vulnerable report: vulnerable/report.json
 - Sanitized reproductions: vulnerable/failure-1.http through vulnerable/failure-$($script:ExpectedCrossCases).http
+- Vulnerable write reports: write-vulnerable/POST, write-vulnerable/PUT, and write-vulnerable/PATCH.
 "@
   Write-Utf8File -Path (Join-Path $script:RunRoot "SUMMARY.md") -Content $summary
   Write-Host ([Environment]::NewLine + "Acceptance passed. See $(Join-Path $script:RunRoot 'SUMMARY.md')")

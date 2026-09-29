@@ -21,6 +21,29 @@ fn test_config(names : Array[String], object_ids : Array[String]) -> Json {
 }
 
 ///|
+fn test_write_config(verb : String, body : String) -> Json raise CliError {
+  let root = test_config(["A", "B"], ["id-a", "id-b"])
+  match root {
+    Json::Object(fields) => {
+      fields["request"] = Json::object({
+        "method": Json::string(verb),
+        "path": Json::string("/objects/{{object_id}}"),
+        "body": Json::string(body),
+        "protected_json_pointers": Json::array([Json::string("/private_note")]),
+      })
+      fields["write_test_data"] = Json::boolean(true)
+      fields["cleanup"] = Json::object({
+        "method": Json::string("PATCH"),
+        "path": Json::string("/objects/{{object_id}}"),
+        "body": Json::string("{\"private_note\":{{baseline:/private_note}}}"),
+      })
+      Json::object(fields)
+    }
+    _ => raise CliError("test config must be an object")
+  }
+}
+
+///|
 fn config_is_rejected(config : Json) -> Bool {
   try {
     let _ = parse_config(config)
@@ -108,6 +131,124 @@ test "config rejects control characters in the request target" {
       })
       assert_true(config_is_rejected(Json::object(fields)))
     }
+    _ => fail("test config must be an object")
+  }
+}
+
+///|
+test "config enables isolated JSON write checks for each supported method" {
+  let body = "{\"private_note\":\"probe {{actor_name}} {{object_id}}\"}"
+  for verb in ["POST", "PUT", "PATCH"] {
+    let config = parse_config(test_write_config(verb, body))
+    assert_eq(config.request_method, verb)
+    assert_true(config.cleanup is Some(_))
+    assert_eq(config.protected_pointers, ["/private_note"])
+  }
+}
+
+///|
+test "write config requires the explicit test data acknowledgement" {
+  let root = test_write_config("PATCH", "{\"private_note\":\"probe\"}")
+  match root {
+    Json::Object(fields) => {
+      fields.remove("write_test_data")
+      assert_true(config_is_rejected(Json::object(fields)))
+      fields["write_test_data"] = Json::boolean(false)
+      assert_true(config_is_rejected(Json::object(fields)))
+    }
+    _ => fail("test config must be an object")
+  }
+}
+
+///|
+test "write config requires protected state pointers" {
+  let root = test_write_config("PATCH", "{\"private_note\":\"probe\"}")
+  match root {
+    Json::Object(fields) =>
+      match fields["request"] {
+        Json::Object(request) => {
+          request.remove("protected_json_pointers")
+          fields["request"] = Json::object(request)
+          assert_true(config_is_rejected(Json::object(fields)))
+        }
+        _ => fail("test request must be an object")
+      }
+    _ => fail("test config must be an object")
+  }
+}
+
+///|
+test "write config requires cleanup to restore every protected field" {
+  let root = test_write_config("PATCH", "{\"private_note\":\"probe\"}")
+  match root {
+    Json::Object(fields) => {
+      fields["cleanup"] = Json::object({
+        "method": Json::string("PATCH"),
+        "path": Json::string("/objects/{{object_id}}"),
+        "body": Json::string("{\"private_note\":\"constant\"}"),
+      })
+      assert_true(config_is_rejected(Json::object(fields)))
+    }
+    _ => fail("test config must be an object")
+  }
+}
+
+///|
+test "write config rejects malformed JSON bodies and unsupported methods" {
+  assert_true(config_is_rejected(test_write_config("DELETE", "{}")))
+  assert_true(config_is_rejected(test_write_config("PATCH", "{bad json}")))
+  assert_true(
+    config_is_rejected(
+      test_write_config("PATCH", "{\"private_note\":\"{{unknown}}\"}"),
+    ),
+  )
+}
+
+///|
+test "GET config rejects a body and cleanup" {
+  let body_root = test_config(["A", "B"], ["id-a", "id-b"])
+  match body_root {
+    Json::Object(fields) => {
+      fields["request"] = Json::object({
+        "method": Json::string("GET"),
+        "path": Json::string("/objects/{{object_id}}"),
+        "body": Json::string("{}"),
+      })
+      assert_true(config_is_rejected(Json::object(fields)))
+    }
+    _ => fail("test config must be an object")
+  }
+
+  let cleanup_root = test_config(["A", "B"], ["id-a", "id-b"])
+  match cleanup_root {
+    Json::Object(fields) => {
+      fields["cleanup"] = Json::object({
+        "method": Json::string("PATCH"),
+        "path": Json::string("/objects/{{object_id}}"),
+        "body": Json::string("{}"),
+      })
+      assert_true(config_is_rejected(Json::object(fields)))
+    }
+    _ => fail("test config must be an object")
+  }
+}
+
+///|
+test "write config rejects cleanup that cannot restore all protected fields" {
+  let root = test_write_config("PATCH", "{\"private_note\":\"probe\"}")
+  match root {
+    Json::Object(fields) =>
+      match fields["request"] {
+        Json::Object(request) => {
+          request["protected_json_pointers"] = Json::array([
+            Json::string("/private_note"),
+            Json::string("/email"),
+          ])
+          fields["request"] = Json::object(request)
+          assert_true(config_is_rejected(Json::object(fields)))
+        }
+        _ => fail("test request must be an object")
+      }
     _ => fail("test config must be an object")
   }
 }

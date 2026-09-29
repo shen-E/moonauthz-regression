@@ -17,6 +17,61 @@ async fn send_get(url : String, headers : @http.Headers) -> (Int, String) {
 }
 
 ///|
+fn http_method(verb : String) -> @http.RequestMethod {
+  match verb {
+    "GET" => @http.Get
+    "POST" => @http.Post
+    "PUT" => @http.Put
+    "PATCH" => @http.Patch
+    _ => @http.Get
+  }
+}
+
+///|
+async fn send_request(
+  url : String,
+  verb : String,
+  headers : @http.Headers,
+  body : String,
+) -> (Int, String) {
+  let (response, response_body) = @http.request(
+    url,
+    http_method(verb),
+    headers,
+    body,
+  )
+  (response.code, response_body.text())
+}
+
+///|
+async fn try_send_get(
+  url : String,
+  headers : @http.Headers,
+) -> (Int, String, Bool) {
+  try {
+    let (status, body) = send_get(url, headers)
+    (status, body, false)
+  } catch {
+    _ => (0, "", true)
+  }
+}
+
+///|
+async fn try_send_request(
+  url : String,
+  verb : String,
+  headers : @http.Headers,
+  body : String,
+) -> (Int, String, Bool) {
+  try {
+    let (status, response_body) = send_request(url, verb, headers, body)
+    (status, response_body, false)
+  } catch {
+    _ => (0, "", true)
+  }
+}
+
+///|
 fn marker_sources_in(
   body : String,
   markers : Array[Marker],
@@ -75,24 +130,32 @@ fn create_case(
   case_name : String,
   identity : Identity,
   target_object : String,
+  verb : String,
   url : String,
+  request_body : String,
   status : Int,
   expected : String,
   actual : String,
   passed : Bool,
   leaks : Array[String],
+  state_changes : Array[String],
+  cleanup_status : Int?,
   display_headers : Map[String, String],
 ) -> TestCase {
   {
     case_name,
     identity: identity.name,
     target_object,
+    verb,
     url,
+    request_body,
     status,
     expected,
     actual,
     passed,
     leaks,
+    state_changes,
+    cleanup_status,
     display_headers,
   }
 }
@@ -111,13 +174,18 @@ fn case_json(test_case : TestCase) -> Json {
     "case": Json::string(test_case.case_name),
     "identity": Json::string(test_case.identity),
     "target_object": Json::string(test_case.target_object),
-    "method": Json::string("GET"),
+    "method": Json::string(test_case.verb),
     "url": Json::string(test_case.url),
     "status": Json::Json(test_case.status),
     "expected": Json::string(test_case.expected),
     "actual": Json::string(test_case.actual),
     "passed": Json::boolean(test_case.passed),
     "leaks": Json::array(leaks),
+    "state_changes": Json::array(test_case.state_changes.map(Json::string)),
+    "cleanup_status": match test_case.cleanup_status {
+      Some(status) => Json::Json(status)
+      None => Json::null()
+    },
     "request_headers": Json::object(headers),
   })
 }
@@ -128,6 +196,7 @@ async fn write_report(
   exit_code : Int,
   cases : Array[TestCase],
   setup_errors : Array[String],
+  execution_errors : Array[String],
 ) -> Unit {
   @fs.mkdir(output_dir, recursive=true, allow_exist=true)
   let case_values : Array[Json] = []
@@ -137,6 +206,10 @@ async fn write_report(
   let errors : Array[Json] = []
   for message in setup_errors {
     errors.push(Json::string(message))
+  }
+  let runtime_errors : Array[Json] = []
+  for message in execution_errors {
+    runtime_errors.push(Json::string(message))
   }
   let status = if exit_code == 0 {
     "passed"
@@ -151,6 +224,7 @@ async fn write_report(
     "exit_code": Json::Json(exit_code),
     "cases": Json::array(case_values),
     "setup_errors": Json::array(errors),
+    "execution_errors": Json::array(runtime_errors),
   })
   @fs.write_file(output_dir + "/report.json", report.stringify(indent=2))
 }
@@ -164,11 +238,14 @@ async fn write_reproduction(
   let mut text = "### Reproduce \{test_case.case_name}\n"
   text = text +
     "### Credentials are environment placeholders, never stored here.\n"
-  text = text + "GET \{test_case.url} HTTP/1.1\n"
+  text = text + "\{test_case.verb} \{test_case.url} HTTP/1.1\n"
   for (name, value) in test_case.display_headers {
     text = text + "\{name}: \{value}\n"
   }
   text = text + "\n"
+  if test_case.verb != "GET" {
+    text = text + test_case.request_body + "\n"
+  }
   @fs.write_file(output_dir + "/failure-\{index}.http", text)
 }
 
@@ -182,10 +259,13 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
   @fs.mkdir(output_dir, recursive=true, allow_exist=true)
   let cases : Array[TestCase] = []
   let setup_errors : Array[String] = []
+  let execution_errors : Array[String] = []
   let baseline_markers : Array[Array[Marker]] = []
+  let baseline_states : Array[Array[FieldSnapshot]] = []
   let baseline_ok : Array[Bool] = []
   for i = 0; i < config.identities.length(); i = i + 1 {
     baseline_markers.push([])
+    baseline_states.push([])
     baseline_ok.push(false)
   }
 
@@ -207,6 +287,9 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
     } else {
       try {
         baseline_markers[i] = extract_markers(config, identity, body)
+        if config.request_method != "GET" {
+          baseline_states[i] = extract_state(body, config.protected_pointers)
+        }
         baseline_ok[i] = true
       } catch {
         CliError(message) => {
@@ -221,19 +304,23 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
         "baseline-\{identity.name}",
         identity,
         identity.object_id,
+        "GET",
         url,
+        "",
         status,
         "HTTP \{status_codes_text(identity.baseline_statuses)} 且敏感字段可提取",
         actual,
         passed && baseline_ok[i],
         [],
+        [],
+        None,
         display_headers(config, identity),
       ),
     )
   }
 
   if setup_errors.length() > 0 {
-    write_report(output_dir, 2, cases, setup_errors)
+    write_report(output_dir, 2, cases, setup_errors, execution_errors)
     for test_case in cases {
       let label = if test_case.passed { "PASS" } else { "ERROR" }
       println(
@@ -256,33 +343,173 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
         let target = config.identities[target_index]
         let url = build_url(config, target.object_id)
         ensure_same_origin(config, url)
+        let request_body = if config.request_method == "GET" {
+          ""
+        } else {
+          render_write_body(config, actor, target)
+        }
         let headers = resolved_headers(config, actor)
-        let (status, body) = send_get(url, headers)
+        let (status, body, request_failed) = try_send_request(
+          url,
+          config.request_method,
+          headers,
+          request_body,
+        )
+        let state_changes : Array[String] = []
+        let mut cleanup_status : Int? = None
+        let mut case_execution_ok = !request_failed
+        if request_failed {
+          execution_errors.push(
+            "身份 \{actor.name} 的跨对象请求失败；仍会尝试执行清理",
+          )
+        }
         let leaks = marker_sources_in(
           body,
           baseline_markers[target_index],
           config.leak_detection,
         )
         let denied = config.denied_statuses.contains(status)
-        let passed = denied && leaks.length() == 0
-        let actual = if leaks.length() > 0 {
-          "HTTP \{status}; 响应包含受保护标记: " +
-          join_strings(leaks, ", ")
-        } else if denied {
-          "HTTP \{status}; 未发现受保护标记"
+        if config.request_method != "GET" {
+          let target_url = build_url(config, target.object_id)
+          ensure_same_origin(config, target_url)
+          let owner_headers = resolved_headers(config, target)
+          let (owner_status, owner_body, owner_read_failed) = try_send_get(
+            target_url, owner_headers,
+          )
+          if owner_read_failed ||
+            !target.baseline_statuses.contains(owner_status) {
+            case_execution_ok = false
+            execution_errors.push(
+              "身份 \{target.name} 写入后无法读取自有对象: HTTP \{owner_status}",
+            )
+          } else {
+            try {
+              let changed = changed_state_fields(
+                owner_body,
+                baseline_states[target_index],
+              )
+              for pointer in changed {
+                state_changes.push(pointer)
+              }
+            } catch {
+              CliError(message) => {
+                case_execution_ok = false
+                execution_errors.push(message)
+              }
+            }
+          }
+
+          let cleanup = match config.cleanup {
+            Some(value) => value
+            None => raise CliError("写请求缺少清理配置")
+          }
+          let cleanup_url = config.base_url +
+            replace_all(
+              cleanup.path_template,
+              "{{object_id}}",
+              url_component_encode(target.object_id),
+            )
+          ensure_same_origin(config, cleanup_url)
+          let cleanup_body = render_cleanup_body(
+            cleanup,
+            target,
+            target,
+            baseline_states[target_index],
+          )
+          let cleanup_headers = resolved_headers(config, target)
+          let (cleanup_result, _, cleanup_failed) = try_send_request(
+            cleanup_url,
+            cleanup.verb,
+            cleanup_headers,
+            cleanup_body,
+          )
+          if cleanup_failed {
+            case_execution_ok = false
+            execution_errors.push(
+              "身份 \{target.name} 的清理请求未完成",
+            )
+          } else {
+            cleanup_status = Some(cleanup_result)
+          }
+          if !cleanup_failed &&
+            !cleanup.success_statuses.contains(cleanup_result) {
+            case_execution_ok = false
+            execution_errors.push(
+              "身份 \{target.name} 清理请求返回未配置的 HTTP \{cleanup_result}",
+            )
+          }
+
+          let (verify_status, verify_body, verify_failed) = try_send_get(
+            target_url, owner_headers,
+          )
+          if verify_failed || !target.baseline_statuses.contains(verify_status) {
+            case_execution_ok = false
+            execution_errors.push(
+              "身份 \{target.name} 清理后无法复核自有对象: HTTP \{verify_status}",
+            )
+          } else {
+            try {
+              let remaining = changed_state_fields(
+                verify_body,
+                baseline_states[target_index],
+              )
+              for pointer in remaining {
+                state_changes.push("cleanup:" + pointer)
+                case_execution_ok = false
+                execution_errors.push(
+                  "身份 \{target.name} 清理后字段仍与基线不同: " +
+                  pointer,
+                )
+              }
+            } catch {
+              CliError(message) => {
+                case_execution_ok = false
+                execution_errors.push(message)
+              }
+            }
+          }
+        }
+        let passed = denied &&
+          leaks.length() == 0 &&
+          state_changes.length() == 0 &&
+          case_execution_ok
+        let mut actual = "HTTP \{status}"
+        if leaks.length() > 0 {
+          actual = actual +
+            "; 响应包含受保护标记: " +
+            join_strings(leaks, ", ")
         } else {
-          "HTTP \{status}; 状态码不属于拒绝集合"
+          actual = actual + "; 未发现受保护标记"
+        }
+        if !denied {
+          actual = actual + "; 状态码不属于拒绝集合"
+        }
+        if state_changes.length() > 0 {
+          actual = actual +
+            "; 对象状态变化: " +
+            join_strings(state_changes, ", ")
+        }
+        if cleanup_status is Some(cleanup_result) {
+          actual = actual + "; 清理 HTTP \{cleanup_result}"
         }
         let test_case = create_case(
           "cross-\{actor.name}-to-\{target.name}",
           actor,
           target.object_id,
+          config.request_method,
           url,
+          request_body,
           status,
-          "HTTP \{status_codes_text(config.denied_statuses)} 且不含目标对象 ID/敏感值",
+          if config.request_method == "GET" {
+            "HTTP \{status_codes_text(config.denied_statuses)} 且不含目标对象 ID/敏感值"
+          } else {
+            "HTTP \{status_codes_text(config.denied_statuses)}，对象状态不变且清理后恢复基线"
+          },
           actual,
           passed,
           leaks,
+          state_changes,
+          cleanup_status,
           display_headers(config, actor),
         )
         cases.push(test_case)
@@ -294,8 +521,14 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
     }
   }
 
-  let exit_code = if failure_count == 0 { 0 } else { 1 }
-  write_report(output_dir, exit_code, cases, setup_errors)
+  let exit_code = if execution_errors.length() > 0 {
+    2
+  } else if failure_count == 0 {
+    0
+  } else {
+    1
+  }
+  write_report(output_dir, exit_code, cases, setup_errors, execution_errors)
   for test_case in cases {
     let label = if test_case.passed { "PASS" } else { "FAIL" }
     println(

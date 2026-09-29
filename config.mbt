@@ -16,11 +16,29 @@ priv struct Identity {
 priv struct AppConfig {
   base_url : String
   path_template : String
+  request_method : String
+  request_body : String?
   object_id_pointer : String
   leak_detection : String
+  protected_pointers : Array[String]
+  cleanup : CleanupConfig?
   common_headers : Map[String, String]
   identities : Array[Identity]
   denied_statuses : Array[Int]
+}
+
+///|
+priv struct CleanupConfig {
+  verb : String
+  path_template : String
+  body_template : String
+  success_statuses : Array[Int]
+}
+
+///|
+priv struct FieldSnapshot {
+  pointer : String
+  value : Json
 }
 
 ///|
@@ -36,12 +54,16 @@ priv struct TestCase {
   case_name : String
   identity : String
   target_object : String
+  verb : String
   url : String
+  request_body : String
   status : Int
   expected : String
   actual : String
   passed : Bool
   leaks : Array[String]
+  state_changes : Array[String]
+  cleanup_status : Int?
   display_headers : Map[String, String]
 }
 
@@ -157,6 +179,15 @@ fn string_array(
 }
 
 ///|
+fn required_boolean(value : Json, key : String) -> Bool raise CliError {
+  match required_field(value, key) {
+    Json::True => true
+    Json::False => false
+    _ => raise CliError("字段必须是布尔值: " + key)
+  }
+}
+
+///|
 fn decode_pointer_segment(segment : String) -> String {
   let mut decoded = segment
   while decoded.contains("~1") {
@@ -258,30 +289,18 @@ fn parse_config(root : Json) -> AppConfig raise CliError {
 
   let request = required_field(root, "request")
   let method_text = optional_string(request, "method", "GET")
-  if method_text != "GET" {
-    raise CliError("首版只支持 GET 请求")
+  if !is_supported_method(method_text) {
+    raise CliError("request.method 只能是 GET、POST、PUT 或 PATCH")
+  }
+  let body_template = optional_string(request, "body", "")
+  if method_text == "GET" && body_template != "" {
+    raise CliError("GET 请求不能配置 request.body")
+  }
+  if method_text != "GET" && body_template == "" {
+    raise CliError("写请求必须配置 JSON request.body")
   }
   let path_template = required_string(request, "path")
-  if !path_template.has_prefix("/") || path_template.has_prefix("//") {
-    raise CliError(
-      "request.path 必须是以单个 / 开头的相对路径模板",
-    )
-  }
-  if !path_template.contains("{{object_id}}") {
-    raise CliError("request.path 必须包含 {{object_id}}")
-  }
-  if count_occurrences(path_template, "{{object_id}}") != 1 {
-    raise CliError("request.path 必须且只能包含一个 {{object_id}}")
-  }
-  if path_template.contains("#") ||
-    path_template.contains("\\") ||
-    path_template.contains("\r") ||
-    path_template.contains("\n") ||
-    path_template.contains("\t") {
-    raise CliError(
-      "request.path 不能包含 fragment、反斜杠或控制字符",
-    )
-  }
+  validate_path_template(path_template, "request.path")
   let leak_detection = optional_string(root, "leak_detection", "json_pointer")
   if leak_detection != "json_pointer" && leak_detection != "substring" {
     raise CliError("leak_detection 只能是 json_pointer 或 substring")
@@ -294,6 +313,45 @@ fn parse_config(root : Json) -> AppConfig raise CliError {
     object_field(request, "headers"),
     "request.headers",
   )
+
+  let protected_pointers = string_array(
+    object_field(request, "protected_json_pointers"),
+    "request.protected_json_pointers",
+  )
+  for pointer in protected_pointers {
+    if !is_json_pointer(pointer) {
+      raise CliError(
+        "受保护状态路径必须是有效 JSON Pointer: " + pointer,
+      )
+    }
+  }
+  let cleanup = if method_text == "GET" {
+    if object_field(root, "cleanup") is Some(_) {
+      raise CliError("GET 用例不能配置 cleanup")
+    }
+    None
+  } else {
+    if required_boolean(root, "write_test_data") != true {
+      raise CliError("写请求必须显式设置 write_test_data: true")
+    }
+    if protected_pointers.length() == 0 {
+      raise CliError(
+        "写请求必须配置 request.protected_json_pointers，便于验证对象状态",
+      )
+    }
+    let sample_request_body = render_body_tokens(
+      body_template, "sample-actor", "sample-object", "sample-id",
+    )
+    if sample_request_body.contains("{{") {
+      raise CliError("request.body 包含不支持的模板标记")
+    }
+    ignore(
+      @json.parse(sample_request_body) catch {
+        _ => raise CliError("request.body 模板展开后必须是有效 JSON")
+      },
+    )
+    Some(parse_cleanup(required_field(root, "cleanup"), protected_pointers))
+  }
 
   let raw_identities = required_field(root, "identities")
   let identities = match raw_identities {
@@ -363,12 +421,94 @@ fn parse_config(root : Json) -> AppConfig raise CliError {
   {
     base_url: normalized_base,
     path_template,
+    request_method: method_text,
+    request_body: if body_template == "" {
+      None
+    } else {
+      Some(body_template)
+    },
     object_id_pointer,
     leak_detection,
+    protected_pointers,
+    cleanup,
     common_headers,
     identities,
     denied_statuses,
   }
+}
+
+///|
+fn is_supported_method(verb : String) -> Bool {
+  verb == "GET" || verb == "POST" || verb == "PUT" || verb == "PATCH"
+}
+
+///|
+fn validate_path_template(
+  path : String,
+  field_name : String,
+) -> Unit raise CliError {
+  if !path.has_prefix("/") || path.has_prefix("//") {
+    raise CliError(
+      field_name + " 必须是以单个 / 开头的相对路径模板",
+    )
+  }
+  if count_occurrences(path, "{{object_id}}") != 1 {
+    raise CliError(field_name + " 必须且只能包含一个 {{object_id}}")
+  }
+  if path.contains("#") ||
+    path.contains("\\") ||
+    path.contains("\r") ||
+    path.contains("\n") ||
+    path.contains("\t") {
+    raise CliError(
+      field_name + " 不能包含 fragment、反斜杠或控制字符",
+    )
+  }
+}
+
+///|
+fn parse_cleanup(
+  value : Json,
+  protected_pointers : Array[String],
+) -> CleanupConfig raise CliError {
+  let verb = required_string(value, "method")
+  if verb != "POST" && verb != "PUT" && verb != "PATCH" {
+    raise CliError("cleanup.method 只能是 POST、PUT 或 PATCH")
+  }
+  let path_template = required_string(value, "path")
+  validate_path_template(path_template, "cleanup.path")
+  let body_template = required_string(value, "body")
+  if body_template == "" {
+    raise CliError("cleanup.body 不能为空")
+  }
+  let success_statuses = match object_field(value, "success_statuses") {
+    None => [200, 204]
+    Some(statuses) => int_array(statuses, "cleanup.success_statuses")
+  }
+  let mut sample_body = body_template
+  for pointer in protected_pointers {
+    let marker = "{{baseline:" + pointer + "}}"
+    if !sample_body.contains(marker) {
+      raise CliError("cleanup.body 必须恢复受保护字段: " + pointer)
+    }
+    sample_body = replace_all(
+      sample_body,
+      marker,
+      Json::string("baseline").stringify(),
+    )
+  }
+  sample_body = render_body_tokens(
+    sample_body, "sample-actor", "sample-object", "sample-id",
+  )
+  if sample_body.contains("{{") {
+    raise CliError("cleanup.body 包含不支持的模板标记")
+  }
+  ignore(
+    @json.parse(sample_body) catch {
+      _ => raise CliError("cleanup.body 模板展开后必须是有效 JSON")
+    },
+  )
+  { verb, path_template, body_template, success_statuses, }
 }
 
 ///|
@@ -422,6 +562,82 @@ fn replace_all(
 }
 
 ///|
+fn json_string_content(value : String) -> String {
+  let quoted = Json::string(value).stringify()
+  quoted[1:quoted.length() - 1].to_owned()
+}
+
+///|
+fn render_body_tokens(
+  template : String,
+  actor_name : String,
+  actor_id : String,
+  target_id : String,
+) -> String {
+  let out = replace_all(
+    template,
+    "{{actor_name}}",
+    json_string_content(actor_name),
+  )
+  let out = replace_all(out, "{{actor_id}}", json_string_content(actor_id))
+  replace_all(out, "{{object_id}}", json_string_content(target_id))
+}
+
+///|
+fn render_write_body(
+  config : AppConfig,
+  actor : Identity,
+  target : Identity,
+) -> String raise CliError {
+  let template = match config.request_body {
+    Some(value) => value
+    None => raise CliError("写请求缺少 request.body")
+  }
+  let body = render_body_tokens(
+    template,
+    actor.name,
+    actor.object_id,
+    target.object_id,
+  )
+  if body.contains("{{") {
+    raise CliError("request.body 包含不支持的模板标记")
+  }
+  ignore(
+    @json.parse(body) catch {
+      _ => raise CliError("request.body 模板展开后不是有效 JSON")
+    },
+  )
+  body
+}
+
+///|
+fn render_cleanup_body(
+  cleanup : CleanupConfig,
+  actor : Identity,
+  target : Identity,
+  baseline : Array[FieldSnapshot],
+) -> String raise CliError {
+  let mut body = cleanup.body_template
+  for snapshot in baseline {
+    body = replace_all(
+      body,
+      "{{baseline:" + snapshot.pointer + "}}",
+      snapshot.value.stringify(),
+    )
+  }
+  body = render_body_tokens(body, actor.name, actor.object_id, target.object_id)
+  if body.contains("{{") {
+    raise CliError("cleanup.body 包含不支持的模板标记")
+  }
+  ignore(
+    @json.parse(body) catch {
+      _ => raise CliError("cleanup.body 模板展开后不是有效 JSON")
+    },
+  )
+  body
+}
+
+///|
 fn resolve_env(template : String) -> String raise CliError {
   let prefix = "${ENV:"
   let mut remaining = template
@@ -458,6 +674,10 @@ fn resolved_headers(
   for (name, template) in identity.headers {
     headers[@http.CaseInsensitiveString(name)] = resolve_env(template)
   }
+  if config.request_method != "GET" &&
+    !headers.contains(@http.CaseInsensitiveString("Content-Type")) {
+    headers[@http.CaseInsensitiveString("Content-Type")] = "application/json"
+  }
   headers
 }
 
@@ -480,6 +700,9 @@ fn display_headers(
     } else {
       "<REDACTED>"
     }
+  }
+  if config.request_method != "GET" && !headers.contains("Content-Type") {
+    headers["Content-Type"] = "application/json"
   }
   headers
 }
@@ -610,4 +833,42 @@ fn extract_markers(
     }
   }
   markers
+}
+
+///|
+fn extract_state(
+  body : String,
+  pointers : Array[String],
+) -> Array[FieldSnapshot] raise CliError {
+  let json = @json.parse(body) catch {
+    _ => raise CliError("对象状态响应不是有效 JSON")
+  }
+  let snapshots : Array[FieldSnapshot] = []
+  for pointer in pointers {
+    match json_pointer(json, pointer) {
+      Some(value) => snapshots.push({ pointer, value, })
+      None =>
+        raise CliError("对象状态响应缺少受保护字段: " + pointer)
+    }
+  }
+  snapshots
+}
+
+///|
+fn changed_state_fields(
+  body : String,
+  baseline : Array[FieldSnapshot],
+) -> Array[String] raise CliError {
+  let pointers : Array[String] = []
+  for snapshot in baseline {
+    pointers.push(snapshot.pointer)
+  }
+  let current = extract_state(body, pointers)
+  let changed : Array[String] = []
+  for i = 0; i < baseline.length(); i = i + 1 {
+    if !Json::equal(baseline[i].value, current[i].value) {
+      changed.push(baseline[i].pointer)
+    }
+  }
+  changed
 }

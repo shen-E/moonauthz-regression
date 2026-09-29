@@ -1,0 +1,51 @@
+{
+  "base_url": "http://127.0.0.1:8095",
+  "leak_detection": "json_pointer",
+  "object_id_json_pointer": "/id",
+  "write_test_data": true,
+  "request": {
+    "method": "PATCH",
+    "path": "/orders/{{object_id}}",
+    "body": "{\"private_note\":\"probe by {{actor_name}} for {{object_id}}\"}",
+    "headers": {
+      "Accept": "application/json"
+    },
+    "protected_json_pointers": ["/private_note"]
+  },
+  "cleanup": {
+    "method": "PATCH",
+    "path": "/orders/{{object_id}}",
+    "body": "{\"private_note\":{{baseline:/private_note}}}",
+    "success_statuses": [200, 204]
+  },
+  "identities": [
+    {
+      "name": "A",
+      "object_id": "order-a-100",
+      "headers": {
+        "Authorization": "Bearer ${ENV:MOONAUTHZ_TOKEN_A}"
+      },
+      "baseline_statuses": [200],
+      "sensitive_json_pointers": ["/email", "/private_note"]
+    },
+    {
+      "name": "B",
+      "object_id": "order-b-200",
+      "headers": {
+        "Authorization": "Bearer ${ENV:MOONAUTHZ_TOKEN_B}"
+      },
+      "baseline_statuses": [200],
+      "sensitive_json_pointers": ["/email", "/private_note"]
+    },
+    {
+      "name": "C",
+      "object_id": "order-c-300",
+      "headers": {
+        "Authorization": "Bearer ${ENV:MOONAUTHZ_TOKEN_C}"
+      },
+      "baseline_statuses": [200],
+      "sensitive_json_pointers": ["/email", "/private_note"]
+    }
+  ],
+  "denied_statuses": [403, 404]
+}

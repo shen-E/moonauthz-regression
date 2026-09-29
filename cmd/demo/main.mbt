@@ -11,32 +11,50 @@ async fn write_json(
 }
 
 ///|
-fn order_response(object_id : String) -> String? {
-  match object_id {
-    "order-a-100" =>
-      Some(
-        "{\"id\":\"order-a-100\",\"owner\":\"A\",\"email\":\"alice-private@example.test\",\"private_note\":\"A-only shipping note\"}",
-      )
-    "order-b-200" =>
-      Some(
-        "{\"id\":\"order-b-200\",\"owner\":\"B\",\"email\":\"bob-private@example.test\",\"private_note\":\"B-only refund note\"}",
-      )
-    "order-c-300" =>
-      Some(
-        "{\"id\":\"order-c-300\",\"owner\":\"C\",\"email\":\"carol-private@example.test\",\"private_note\":\"C-only invoice note\"}",
-      )
-    _ => None
-  }
+priv struct DemoOrder {
+  owner : String
+  email : String
+  mut private_note : String
 }
 
 ///|
-fn order_owner(object_id : String) -> String? {
-  match object_id {
-    "order-a-100" => Some("A")
-    "order-b-200" => Some("B")
-    "order-c-300" => Some("C")
-    _ => None
-  }
+fn demo_orders() -> Map[String, DemoOrder] {
+  Map::from_array([
+    (
+      "order-a-100",
+      {
+        owner: "A",
+        email: "alice-private@example.test",
+        private_note: "A-only shipping note",
+      },
+    ),
+    (
+      "order-b-200",
+      {
+        owner: "B",
+        email: "bob-private@example.test",
+        private_note: "B-only refund note",
+      },
+    ),
+    (
+      "order-c-300",
+      {
+        owner: "C",
+        email: "carol-private@example.test",
+        private_note: "C-only invoice note",
+      },
+    ),
+  ])
+}
+
+///|
+fn order_response(object_id : String, order : DemoOrder) -> String {
+  Json::object({
+    "id": Json::string(object_id),
+    "owner": Json::string(order.owner),
+    "email": Json::string(order.email),
+    "private_note": Json::string(order.private_note),
+  }).stringify()
 }
 
 ///|
@@ -60,10 +78,20 @@ fn path_object_id(path : String) -> String? {
 ///|
 async fn serve_request(
   vulnerable : Bool,
+  orders : Map[String, DemoOrder],
   request : @http.Request,
+  body_reader : &@io.Reader,
   conn : @http.ServerConnection,
 ) -> Unit {
-  if request.meth != Get {
+  let body_text = if request.meth == @http.Get {
+    ""
+  } else {
+    body_reader.read_all().text()
+  }
+  if request.meth != @http.Get &&
+    request.meth != @http.Post &&
+    request.meth != @http.Put &&
+    request.meth != @http.Patch {
     return write_json(
       conn, 405, "Method Not Allowed", "{\"error\":\"method_not_allowed\"}",
     )
@@ -82,15 +110,57 @@ async fn serve_request(
       match path_object_id(request.path) {
         None => write_json(conn, 404, "Not Found", "{\"error\":\"not_found\"}")
         Some(object_id) =>
-          match order_response(object_id) {
+          match orders.get(object_id) {
             None =>
               write_json(conn, 404, "Not Found", "{\"error\":\"not_found\"}")
-            Some(body) =>
-              if vulnerable || order_owner(object_id) == Some(user) {
-                write_json(conn, 200, "OK", body)
-              } else {
-                // Conceal cross-user objects with the same response used for missing IDs.
+            Some(order) =>
+              if request.meth == @http.Get {
+                if vulnerable || order.owner == user {
+                  write_json(conn, 200, "OK", order_response(object_id, order))
+                } else {
+                  // Conceal cross-user objects with the same response used for missing IDs.
+                  write_json(
+                    conn, 404, "Not Found", "{\"error\":\"not_found\"}",
+                  )
+                }
+              } else if !vulnerable && order.owner != user {
                 write_json(conn, 404, "Not Found", "{\"error\":\"not_found\"}")
+              } else {
+                let payload = @json.parse(body_text) catch {
+                  _ =>
+                    return write_json(
+                      conn, 400, "Bad Request", "{\"error\":\"invalid_json\"}",
+                    )
+                }
+                let private_note = match payload {
+                  Json::Object(fields) =>
+                    match fields.get("private_note") {
+                      Some(Json::String(value)) => value
+                      _ =>
+                        return write_json(
+                          conn, 400, "Bad Request", "{\"error\":\"private_note_required\"}",
+                        )
+                    }
+                  _ =>
+                    return write_json(
+                      conn, 400, "Bad Request", "{\"error\":\"json_object_required\"}",
+                    )
+                }
+                let updated = order
+                updated.private_note = private_note
+                orders[object_id] = updated
+                if order.owner == user {
+                  conn.send_response(204, "No Content")
+                  conn.end_response()
+                } else {
+                  let updated_order = orders[object_id]
+                  write_json(
+                    conn,
+                    200,
+                    "OK",
+                    order_response(object_id, updated_order),
+                  )
+                }
               }
           }
       }
@@ -127,10 +197,11 @@ async fn main {
     @sys.exit(2)
   }
   let vulnerable = mode == "vulnerable"
+  let orders = demo_orders()
   println("Demo API 模式: \{mode}")
   println("监听地址: http://127.0.0.1:8095")
   let server = @http.Server(@socket.Addr::parse("127.0.0.1:8095"))
-  server.run_forever((request, _body, conn) => {
-    serve_request(vulnerable, request, conn)
+  server.run_forever((request, body, conn) => {
+    serve_request(vulnerable, orders, request, body, conn)
   })
 }
