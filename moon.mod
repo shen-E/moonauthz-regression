@@ -15,11 +15,11 @@ version = "0.1.0"
 
 readme = "README.md"
 
-repository = ""
+repository = "https://github.com/shen-E/moonauthz-regression"
 
 license = "Apache-2.0"
 
-keywords = [ ]
+keywords = [ "security", "authorization", "regression-testing", "cli" ]
 
 preferred_target = "native"
 
