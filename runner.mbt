@@ -275,11 +275,17 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
     let url = build_url(config, identity.object_id)
     ensure_same_origin(config, url)
     let headers = resolved_headers(config, identity)
-    let (status, body) = send_get(url, headers)
-    let status_ok = identity.baseline_statuses.contains(status)
+    let (status, body, request_failed) = try_send_get(url, headers)
+    let status_ok = !request_failed &&
+      identity.baseline_statuses.contains(status)
     let mut actual = "HTTP \{status}"
     let mut passed = status_ok
-    if !status_ok {
+    if request_failed {
+      actual = "基线请求网络失败"
+      setup_errors.push(
+        "身份 \{identity.name} 的自有对象基线请求网络失败",
+      )
+    } else if !status_ok {
       actual = actual + "; 自有对象基线状态不在预期范围"
       setup_errors.push(
         "身份 \{identity.name} 的自有对象请求返回 HTTP \{status}",

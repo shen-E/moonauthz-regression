@@ -261,6 +261,14 @@ function Invoke-BoundaryChecks {
       throw "Missing credentials did not produce the expected execution error."
     }
 
+    $unreachableBaseline = Copy-DemoConfig
+    $unreachableBaseline.base_url = "http://127.0.0.1:1"
+    $networkResult = Invoke-BoundaryConfig -Name "baseline-network-failure" -Config $unreachableBaseline -ExpectedExitCode 2
+    $networkBaselines = @($networkResult.Report.cases | Where-Object { $_.case -like "baseline-*" })
+    if ($null -eq $networkResult.Report -or $networkResult.Report.exit_code -ne 2 -or $networkBaselines.Count -ne $script:IdentityCount -or @($networkResult.Report.cases | Where-Object { $_.case -like "cross-*" }).Count -ne 0 -or @($networkBaselines | Where-Object { $_.passed -or $_.status -ne 0 }).Count -ne 0 -or @($networkResult.Report.setup_errors).Count -ne $script:IdentityCount) {
+      throw "A baseline network failure must be reported for every identity and stop cross-identity checks."
+    }
+
     $badBaselineStatus = Copy-DemoConfig
     $badBaselineStatus.identities[0].baseline_statuses = @(201)
     $baselineResult = Invoke-BoundaryConfig -Name "baseline-status-mismatch" -Config $badBaselineStatus -ExpectedExitCode 2
@@ -309,7 +317,7 @@ function Invoke-BoundaryChecks {
     [Environment]::SetEnvironmentVariable($missingTokenName, $previousMissingToken, "Process")
     Stop-DemoServer -Process $server
   }
-  Write-Host "Execution-boundary checks passed: missing credentials, invalid baselines, missing fields, denied-status mismatch, cleanup-status mismatch, and cleanup-state mismatch."
+  Write-Host "Execution-boundary checks passed: missing credentials, baseline network failure, invalid baselines, missing fields, denied-status mismatch, cleanup-status mismatch, and cleanup-state mismatch."
 }
 
 $previousTokens = @{}
@@ -349,7 +357,7 @@ try {
 - Vulnerable API: all owner baselines passed; all cross-identity reads exposed protected markers; CLI exit code 1.
 - Safe write API: all cross-identity POST, PUT, and PATCH requests were denied; protected fields stayed unchanged and cleanup verified successfully; CLI exit code 0.
 - Vulnerable write API: all cross-identity POST, PUT, and PATCH requests changed protected state; cleanup restored every object and the CLI reported exit code 1.
-- Execution boundaries: missing credentials, invalid baselines, missing fields, denied-status mismatch, cleanup-status mismatch, and post-cleanup state mismatch returned their expected exit codes.
+- Execution boundaries: missing credentials, baseline network failure, invalid baselines, missing fields, denied-status mismatch, cleanup-status mismatch, and post-cleanup state mismatch returned their expected exit codes.
 - Credential scan: passed for generated reports, logs, and reproductions.
 - Safe report: safe/report.json
 - Vulnerable report: vulnerable/report.json
