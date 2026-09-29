@@ -17,7 +17,7 @@ MoonBit 编写的 API 对象级授权回归测试 CLI。它用两组身份先读
 
     ./scripts/acceptance.ps1
 
-脚本会运行 moon check --target native，然后自动启动安全版和漏洞版本地 API，使用同一配置执行测试，并核对基线、交叉访问结果、退出码和脱敏复现文件。完整输出保存在 artifacts/acceptance/<运行时间>/，包括两种模式的 JSON 报告、命令日志和 SUMMARY.md。脚本会检查生成的文件中没有演示令牌。
+脚本会先解析 MoonBit 依赖，再运行 moon check --target native，然后自动启动安全版和漏洞版本地 API，使用同一配置执行测试，并核对基线、交叉访问结果、退出码和脱敏复现文件。完整输出保存在 artifacts/acceptance/<运行时间>/，包括两种模式的 JSON 报告、命令日志和 SUMMARY.md。脚本会检查生成的文件中没有演示令牌。
 
 GitHub Actions 会在 push 和 pull request 时运行相同的验收流程。
 

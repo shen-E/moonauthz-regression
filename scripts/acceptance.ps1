@@ -158,6 +158,7 @@ try {
   $env:MOONAUTHZ_TOKEN_B = $script:DemoTokenB
   Write-Host "MoonAuthz Regression acceptance run: $script:RunId"
   Write-Host "Artifacts: $script:RunRoot"
+  $null = Invoke-Moon -Arguments @("update") -LogPath (Join-Path $script:LogsRoot "moon-update.log") -ExpectedExitCode 0
   $null = Invoke-Moon -Arguments @("check", "--target", "native") -LogPath (Join-Path $script:LogsRoot "moon-check.log") -ExpectedExitCode 0
   Invoke-Mode -Mode "safe" -ExpectedExitCode 0
   Invoke-Mode -Mode "vulnerable" -ExpectedExitCode 1
