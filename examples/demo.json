@@ -1,0 +1,31 @@
+{
+  "base_url": "http://127.0.0.1:8095",
+  "request": {
+    "method": "GET",
+    "path": "/orders/{{object_id}}",
+    "headers": {
+      "Accept": "application/json"
+    }
+  },
+  "identities": [
+    {
+      "name": "A",
+      "object_id": "order-a-100",
+      "headers": {
+        "Authorization": "Bearer ${ENV:MOONAUTHZ_TOKEN_A}"
+      },
+      "baseline_statuses": [200],
+      "sensitive_json_pointers": ["/email", "/private_note"]
+    },
+    {
+      "name": "B",
+      "object_id": "order-b-200",
+      "headers": {
+        "Authorization": "Bearer ${ENV:MOONAUTHZ_TOKEN_B}"
+      },
+      "baseline_statuses": [200],
+      "sensitive_json_pointers": ["/email", "/private_note"]
+    }
+  ],
+  "denied_statuses": [403, 404]
+}

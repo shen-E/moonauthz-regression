@@ -1,0 +1,10 @@
+import {
+  "shen-E/moonauthz-regression" @authz,
+  "moonbitlang/core/env",
+  "moonbitlang/async",
+  "moonbitlang/x/sys",
+}
+
+pkgtype(kind: "executable")
+
+supported_targets = "+native"
