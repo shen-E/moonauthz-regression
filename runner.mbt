@@ -217,18 +217,7 @@ fn report_summary(
   setup_errors : Array[String],
   execution_errors : Array[String],
 ) -> Json {
-  let mut passed = 0
-  let mut failed = 0
-  let mut case_errors = 0
-  for test_case in cases {
-    if test_case.passed {
-      passed = passed + 1
-    } else if test_case.execution_error {
-      case_errors = case_errors + 1
-    } else {
-      failed = failed + 1
-    }
-  }
+  let (passed, failed, case_errors) = count_case_results(cases)
   Json::object({
     "total_cases": Json::Json(cases.length()),
     "passed": Json::Json(passed),
@@ -237,6 +226,23 @@ fn report_summary(
     "setup_error_count": Json::Json(setup_errors.length()),
     "execution_error_count": Json::Json(execution_errors.length()),
   })
+}
+
+///|
+fn count_case_results(cases : Array[TestCase]) -> (Int, Int, Int) {
+  let mut passed = 0
+  let mut failed = 0
+  let mut errors = 0
+  for test_case in cases {
+    if test_case.passed {
+      passed = passed + 1
+    } else if test_case.execution_error {
+      errors = errors + 1
+    } else {
+      failed = failed + 1
+    }
+  }
+  (passed, failed, errors)
 }
 
 ///|
@@ -278,6 +284,123 @@ async fn write_report(
   })
   @fs.write_file(output_dir + "/report.json", report.stringify(indent=2))
   report
+}
+
+///|
+fn xml_escape(value : String) -> String {
+  let escaped = replace_all(value, "&", "&amp;")
+  let escaped = replace_all(escaped, "<", "&lt;")
+  let escaped = replace_all(escaped, ">", "&gt;")
+  let escaped = replace_all(escaped, "\"", "&quot;")
+  replace_all(escaped, "'", "&apos;")
+}
+
+///|
+fn junit_case(test_case : TestCase) -> String {
+  let mut xml = "  <testcase classname=\"moonauthz.\{xml_escape(test_case.identity)}\" name=\"\{xml_escape(test_case.case_name)}\" time=\"0\">\n"
+  if !test_case.passed {
+    let tag = if test_case.execution_error { "error" } else { "failure" }
+    xml = xml +
+      "    <\{tag} message=\"\{xml_escape(test_case.actual)}\">\{xml_escape(test_case.actual)}</\{tag}>\n"
+  }
+  xml + "  </testcase>\n"
+}
+
+///|
+async fn write_junit_report(
+  output_dir : String,
+  cases : Array[TestCase],
+) -> Unit {
+  let (passed, failed, errors) = count_case_results(cases)
+  let mut xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+  xml = xml +
+    "<testsuite name=\"moonauthz-regression\" tests=\"\{cases.length()}\" failures=\"\{failed}\" errors=\"\{errors}\">\n"
+  for test_case in cases {
+    xml = xml + junit_case(test_case)
+  }
+  xml = xml + "</testsuite>\n"
+  ignore(passed)
+  @fs.write_file(output_dir + "/report.xml", xml)
+}
+
+///|
+fn markdown_cell(value : String) -> String {
+  let value = replace_all(value, "|", "\\|")
+  let value = replace_all(value, "\r", " ")
+  replace_all(value, "\n", " ")
+}
+
+///|
+async fn write_markdown_report(
+  output_dir : String,
+  exit_code : Int,
+  cases : Array[TestCase],
+  setup_errors : Array[String],
+  execution_errors : Array[String],
+) -> Unit {
+  let (passed, failed, errors) = count_case_results(cases)
+  let status = if exit_code == 0 {
+    "通过"
+  } else if exit_code == 1 {
+    "发现越权"
+  } else {
+    "执行错误"
+  }
+  let mut markdown = "# MoonAuthz Regression 执行摘要\n\n"
+  markdown = markdown +
+    "**结果：** \{status}（退出码 `\{exit_code}`）\n\n"
+  markdown = markdown +
+    "| 用例总数 | 通过 | 越权失败 | 执行错误 | 配置错误 | 运行错误 |\n| ---: | ---: | ---: | ---: | ---: | ---: |\n"
+  markdown = markdown +
+    "| \{cases.length()} | \{passed} | \{failed} | \{errors} | \{setup_errors.length()} | \{execution_errors.length()} |\n\n"
+  markdown = markdown +
+    "| 用例 | 身份 | 方法 | HTTP | 结果 | 说明 |\n| --- | --- | --- | ---: | --- | --- |\n"
+  for test_case in cases {
+    let label = if test_case.passed {
+      "PASS"
+    } else if test_case.execution_error {
+      "ERROR"
+    } else {
+      "FAIL"
+    }
+    markdown = markdown +
+      "| \{markdown_cell(test_case.case_name)} | \{markdown_cell(test_case.identity)} → \{markdown_cell(test_case.target_object)} | \{test_case.verb} | \{test_case.status} | \{label} | \{markdown_cell(test_case.actual)} |\n"
+  }
+  if setup_errors.length() > 0 {
+    markdown = markdown + "\n## 基线错误\n\n"
+    for message in setup_errors {
+      markdown = markdown + "- \{markdown_cell(message)}\n"
+    }
+  }
+  if execution_errors.length() > 0 {
+    markdown = markdown + "\n## 执行错误\n\n"
+    for message in execution_errors {
+      markdown = markdown + "- \{markdown_cell(message)}\n"
+    }
+  }
+  @fs.write_file(output_dir + "/summary.md", markdown)
+}
+
+///|
+async fn write_optional_report(
+  output_dir : String,
+  output_format : String,
+  exit_code : Int,
+  cases : Array[TestCase],
+  setup_errors : Array[String],
+  execution_errors : Array[String],
+) -> String {
+  if output_format == "junit" {
+    write_junit_report(output_dir, cases)
+    output_dir + "/report.xml"
+  } else if output_format == "markdown" {
+    write_markdown_report(
+      output_dir, exit_code, cases, setup_errors, execution_errors,
+    )
+    output_dir + "/summary.md"
+  } else {
+    ""
+  }
 }
 
 ///|
@@ -383,6 +506,9 @@ async fn run_config(
     let report = write_report(
       output_dir, 2, cases, setup_errors, execution_errors,
     )
+    let formatted_report = write_optional_report(
+      output_dir, output_format, 2, cases, setup_errors, execution_errors,
+    )
     if output_format == "json" {
       println(report.stringify(indent=2))
     } else {
@@ -393,6 +519,9 @@ async fn run_config(
         )
       }
       println("报告已写入 \{output_dir}/report.json")
+      if formatted_report != "" {
+        println("附加报告已写入 \{formatted_report}")
+      }
     }
     return 2
   }
@@ -621,6 +750,9 @@ async fn run_config(
   let report = write_report(
     output_dir, exit_code, cases, setup_errors, execution_errors,
   )
+  let formatted_report = write_optional_report(
+    output_dir, output_format, exit_code, cases, setup_errors, execution_errors,
+  )
   if output_format == "json" {
     println(report.stringify(indent=2))
   } else {
@@ -636,6 +768,9 @@ async fn run_config(
       )
     }
     println("报告已写入 \{output_dir}/report.json")
+    if formatted_report != "" {
+      println("附加报告已写入 \{formatted_report}")
+    }
   }
   exit_code
 }
@@ -758,7 +893,7 @@ fn parse_run_arguments(
 ) -> (String, String, Array[String], String) raise CliError {
   if args.length() < 2 {
     raise CliError(
-      "用法: moonauthz-regression run <config.json> [--out <目录>]",
+      "用法: moonauthz-regression run <config.json> [--out <目录>] [--format human|json|junit|markdown]",
     )
   }
   let config_path = args[1]
@@ -775,8 +910,11 @@ fn parse_run_arguments(
       index = index + 2
     } else if args[index] == "--format" && index + 1 < args.length() {
       output_format = args[index + 1]
-      if output_format != "human" && output_format != "json" {
-        raise CliError("--format 只能是 human 或 json")
+      if output_format != "human" &&
+        output_format != "json" &&
+        output_format != "junit" &&
+        output_format != "markdown" {
+        raise CliError("--format 只能是 human、json、junit 或 markdown")
       }
       index = index + 2
     } else {
@@ -818,7 +956,7 @@ fn validate_case_selection(
 async fn run_cli_inner(args : Array[String]) -> Int {
   if args.length() == 0 || args[0] == "--help" || args[0] == "help" {
     println(
-      "用法: moonauthz-regression <run|validate|plan> <config.json> [--out <目录>] [--format human|json]",
+      "用法: moonauthz-regression <run|validate|plan> <config.json> [--out <目录>] [--format human|json|junit|markdown]",
     )
     return 0
   }
