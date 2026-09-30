@@ -251,11 +251,7 @@ async fn write_reproduction(
 
 ///|
 async fn run_config(config_path : String, output_dir : String) -> Int {
-  let config_contents = @fs.read_file(config_path).text()
-  let root = @json.parse(config_contents) catch {
-    _ => raise CliError("配置不是有效 JSON: " + config_path)
-  }
-  let config = parse_config(root)
+  let config = load_config_file(config_path)
   @fs.mkdir(output_dir, recursive=true, allow_exist=true)
   let cases : Array[TestCase] = []
   let setup_errors : Array[String] = []
@@ -561,6 +557,76 @@ fn join_strings(values : Array[String], separator : String) -> String {
 }
 
 ///|
+async fn load_config_file(config_path : String) -> AppConfig {
+  let config_contents = @fs.read_file(config_path).text()
+  let root = @json.parse(config_contents) catch {
+    _ => raise CliError("配置不是有效 JSON: " + config_path)
+  }
+  parse_config(root)
+}
+
+///|
+fn cross_case_count(config : AppConfig) -> Int {
+  config.identities.length() * (config.identities.length() - 1)
+}
+
+///|
+async fn validate_config_file(config_path : String) -> Int {
+  let config = load_config_file(config_path)
+  for identity in config.identities {
+    ignore(resolved_headers(config, identity))
+  }
+  println("配置有效: \{config_path}")
+  println("请求方法: \{config.request_method}")
+  println("测试身份: \{config.identities.length()}")
+  println("跨身份用例: \{cross_case_count(config)}")
+  println("配置和认证模板校验通过；未发送 HTTP 请求")
+  0
+}
+
+///|
+async fn print_config_plan(config_path : String) -> Int {
+  let config = load_config_file(config_path)
+  println("执行计划: \{config.request_method} \{config.path_template}")
+  println("目标服务: \{config.base_url}")
+  println("基线请求: \{config.identities.length()} 个")
+  println("跨身份请求: \{cross_case_count(config)} 个")
+  for actor_index = 0
+      actor_index < config.identities.length()
+      actor_index = actor_index + 1 {
+    for target_index = 0
+        target_index < config.identities.length()
+        target_index = target_index + 1 {
+      if actor_index != target_index {
+        let actor = config.identities[actor_index]
+        let target = config.identities[target_index]
+        println(
+          "  cross-\{actor.name}-to-\{target.name}: \{config.request_method} \{build_url(config, target.object_id)}",
+        )
+      }
+    }
+  }
+  if config.request_method != "GET" {
+    println(
+      "写入安全: 每次跨身份请求后会执行 cleanup 并复核受保护字段",
+    )
+  }
+  println("此命令只读取配置，不会发送 HTTP 请求")
+  0
+}
+
+///|
+fn parse_inspection_config(
+  args : Array[String],
+  command : String,
+) -> String raise CliError {
+  if args.length() != 2 {
+    raise CliError("用法: moonauthz-regression \{command} <config.json>")
+  }
+  args[1]
+}
+
+///|
 fn parse_run_arguments(args : Array[String]) -> (String, String) raise CliError {
   if args.length() < 2 {
     raise CliError(
@@ -584,8 +650,16 @@ fn parse_run_arguments(args : Array[String]) -> (String, String) raise CliError 
 ///|
 async fn run_cli_inner(args : Array[String]) -> Int {
   if args.length() == 0 || args[0] == "--help" || args[0] == "help" {
-    println("用法: moonauthz-regression run <config.json> [--out <目录>]")
+    println(
+      "用法: moonauthz-regression <run|validate|plan> <config.json> [--out <目录>]",
+    )
     return 0
+  }
+  if args[0] == "validate" {
+    return validate_config_file(parse_inspection_config(args, "validate"))
+  }
+  if args[0] == "plan" {
+    return print_config_plan(parse_inspection_config(args, "plan"))
   }
   if args[0] != "run" {
     raise CliError("未知子命令: " + args[0])
