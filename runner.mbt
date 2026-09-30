@@ -357,12 +357,17 @@ async fn run_config(
         } else {
           render_write_body(config, actor, target)
         }
+        let actual_request_body = if config.request_method == "GET" {
+          ""
+        } else {
+          resolve_json_environment(request_body)
+        }
         let headers = resolved_headers(config, actor)
         let (status, body, request_failed) = try_send_request(
           url,
           config.request_method,
           headers,
-          request_body,
+          actual_request_body,
         )
         let state_changes : Array[String] = []
         let mut cleanup_status : Int? = None
@@ -419,12 +424,13 @@ async fn run_config(
               url_component_encode(target.object_id),
             )
           ensure_same_origin(config, cleanup_url)
-          let cleanup_body = render_cleanup_body(
+          let cleanup_body_template = render_cleanup_body(
             cleanup,
             target,
             target,
             baseline_states[target_index],
           )
+          let cleanup_body = resolve_json_environment(cleanup_body_template)
           let cleanup_headers = resolved_headers(config, target)
           let (cleanup_result, _, cleanup_failed) = try_send_request(
             cleanup_url,
@@ -582,6 +588,32 @@ async fn validate_config_file(config_path : String) -> Int {
   let config = load_config_file(config_path)
   for identity in config.identities {
     ignore(resolved_headers(config, identity))
+  }
+  match config.request_body {
+    Some(template) => {
+      let sample_body = render_body_tokens(
+        template, "sample-actor", "sample-object", "sample-id",
+      )
+      ignore(resolve_json_environment(sample_body))
+    }
+    None => ()
+  }
+  match config.cleanup {
+    Some(cleanup) => {
+      let mut sample_body = cleanup.body_template
+      for pointer in config.protected_pointers {
+        sample_body = replace_all(
+          sample_body,
+          "{{baseline:" + pointer + "}}",
+          Json::string("baseline").stringify(),
+        )
+      }
+      sample_body = render_body_tokens(
+        sample_body, "sample-actor", "sample-object", "sample-id",
+      )
+      ignore(resolve_json_environment(sample_body))
+    }
+    None => ()
   }
   println("配置有效: \{config_path}")
   println("请求方法: \{config.request_method}")

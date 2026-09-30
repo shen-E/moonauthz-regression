@@ -663,6 +663,36 @@ fn resolve_env(template : String) -> String raise CliError {
 }
 
 ///|
+fn resolve_json_env_values(value : Json) -> Json raise CliError {
+  match value {
+    Json::String(template) => Json::string(resolve_env(template))
+    Json::Array(items) => {
+      let resolved : Array[Json] = []
+      for item in items {
+        resolved.push(resolve_json_env_values(item))
+      }
+      Json::array(resolved)
+    }
+    Json::Object(fields) => {
+      let resolved : Map[String, Json] = Map([])
+      for (key, item) in fields {
+        resolved[key] = resolve_json_env_values(item)
+      }
+      Json::object(resolved)
+    }
+    _ => value
+  }
+}
+
+///|
+fn resolve_json_environment(template : String) -> String raise CliError {
+  let value = @json.parse(template) catch {
+    _ => raise CliError("请求体模板展开后不是有效 JSON")
+  }
+  resolve_json_env_values(value).stringify()
+}
+
+///|
 fn resolved_headers(
   config : AppConfig,
   identity : Identity,

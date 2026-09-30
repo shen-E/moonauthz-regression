@@ -67,7 +67,7 @@ GitHub Actions 会在 push 和 pull request 时运行相同的验收流程。
 
 ## 配置格式
 
-`examples/demo.json` 展示 GET 配置，`examples/write-demo.json` 展示受保护的 PATCH 流程。配置包含目标 base_url、请求方法和路径、公共请求头、2 到 10 组身份、各自对象 ID、身份请求头、基线成功状态、敏感 JSON Pointer 和跨身份拒绝状态。每个身份会与其他所有身份交叉测试；N 组身份会执行 N×(N−1) 条交叉用例。路径模板使用 `{{object_id}}`；请求头中的 `${ENV:NAME}` 从环境读取。写请求 body 支持 `{{actor_name}}`、`{{actor_id}}` 和 `{{object_id}}`；cleanup body 还支持原始 JSON 值标记 `{{baseline:/pointer}}`。
+`examples/demo.json` 展示 GET 配置，`examples/write-demo.json` 展示受保护的 PATCH 流程。配置包含目标 base_url、请求方法和路径、公共请求头、2 到 10 组身份、各自对象 ID、身份请求头、基线成功状态、敏感 JSON Pointer 和跨身份拒绝状态。每个身份会与其他所有身份交叉测试；N 组身份会执行 N×(N−1) 条交叉用例。路径模板使用 `{{object_id}}`；请求头和写请求、cleanup 的 JSON 字符串值都支持 `${ENV:NAME}` 环境变量。写请求 body 还支持 `{{actor_name}}`、`{{actor_id}}` 和 `{{object_id}}`；cleanup body 还支持原始 JSON 值标记 `{{baseline:/pointer}}`。复现文件保留环境变量占位符，不包含替换后的实际值。
 
 对象字段路径支持 JSON Pointer，包括嵌套对象和数组下标。默认 `leak_detection` 为 `json_pointer`：通过 `object_id_json_pointer`（默认 `/id`）定位对象 ID，并在自有对象基线中确认该字段与配置 ID 一致；敏感 JSON Pointer 的值也会按同一路径进行 JSON 值精确比较。这可避免短 ID 或常见子串造成误报。若接口返回非 JSON 响应，可将 `leak_detection` 设为 `substring`，对完整响应体执行子串扫描；这种模式可能因短字符串或常见文本产生误报。
 
