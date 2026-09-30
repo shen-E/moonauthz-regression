@@ -155,6 +155,7 @@ fn create_case(
   expected : String,
   actual : String,
   passed : Bool,
+  execution_error : Bool,
   leaks : Array[String],
   state_changes : Array[String],
   cleanup_status : Int?,
@@ -171,6 +172,7 @@ fn create_case(
     expected,
     actual,
     passed,
+    execution_error,
     leaks,
     state_changes,
     cleanup_status,
@@ -198,6 +200,7 @@ fn case_json(test_case : TestCase) -> Json {
     "expected": Json::string(test_case.expected),
     "actual": Json::string(test_case.actual),
     "passed": Json::boolean(test_case.passed),
+    "execution_error": Json::boolean(test_case.execution_error),
     "leaks": Json::array(leaks),
     "state_changes": Json::array(test_case.state_changes.map(Json::string)),
     "cleanup_status": match test_case.cleanup_status {
@@ -209,13 +212,41 @@ fn case_json(test_case : TestCase) -> Json {
 }
 
 ///|
+fn report_summary(
+  cases : Array[TestCase],
+  setup_errors : Array[String],
+  execution_errors : Array[String],
+) -> Json {
+  let mut passed = 0
+  let mut failed = 0
+  let mut case_errors = 0
+  for test_case in cases {
+    if test_case.passed {
+      passed = passed + 1
+    } else if test_case.execution_error {
+      case_errors = case_errors + 1
+    } else {
+      failed = failed + 1
+    }
+  }
+  Json::object({
+    "total_cases": Json::Json(cases.length()),
+    "passed": Json::Json(passed),
+    "failed": Json::Json(failed),
+    "case_errors": Json::Json(case_errors),
+    "setup_error_count": Json::Json(setup_errors.length()),
+    "execution_error_count": Json::Json(execution_errors.length()),
+  })
+}
+
+///|
 async fn write_report(
   output_dir : String,
   exit_code : Int,
   cases : Array[TestCase],
   setup_errors : Array[String],
   execution_errors : Array[String],
-) -> Unit {
+) -> Json {
   @fs.mkdir(output_dir, recursive=true, allow_exist=true)
   let case_values : Array[Json] = []
   for test_case in cases {
@@ -240,11 +271,13 @@ async fn write_report(
     "tool": Json::string("moonauthz-regression"),
     "status": Json::string(status),
     "exit_code": Json::Json(exit_code),
+    "summary": report_summary(cases, setup_errors, execution_errors),
     "cases": Json::array(case_values),
     "setup_errors": Json::array(errors),
     "execution_errors": Json::array(runtime_errors),
   })
   @fs.write_file(output_dir + "/report.json", report.stringify(indent=2))
+  report
 }
 
 ///|
@@ -272,6 +305,7 @@ async fn run_config(
   config : AppConfig,
   output_dir : String,
   selected_cases : Array[String],
+  output_format : String,
 ) -> Int {
   @fs.mkdir(output_dir, recursive=true, allow_exist=true)
   let cases : Array[TestCase] = []
@@ -297,6 +331,7 @@ async fn run_config(
       identity.baseline_statuses.contains(status)
     let mut actual = "HTTP \{status}"
     let mut passed = status_ok
+    let mut execution_failed = !status_ok
     if request_failed {
       actual = "基线请求网络失败"
       setup_errors.push(
@@ -317,6 +352,7 @@ async fn run_config(
       } catch {
         CliError(message) => {
           passed = false
+          execution_failed = true
           actual = actual + "; " + message
           setup_errors.push(message)
         }
@@ -334,6 +370,7 @@ async fn run_config(
         "HTTP \{status_codes_text(identity.baseline_statuses)} 且敏感字段可提取",
         actual,
         passed && baseline_ok[i],
+        execution_failed,
         [],
         [],
         None,
@@ -343,14 +380,20 @@ async fn run_config(
   }
 
   if setup_errors.length() > 0 {
-    write_report(output_dir, 2, cases, setup_errors, execution_errors)
-    for test_case in cases {
-      let label = if test_case.passed { "PASS" } else { "ERROR" }
-      println(
-        "\{label} \{test_case.case_name}: expected \{test_case.expected}; actual \{test_case.actual}",
-      )
+    let report = write_report(
+      output_dir, 2, cases, setup_errors, execution_errors,
+    )
+    if output_format == "json" {
+      println(report.stringify(indent=2))
+    } else {
+      for test_case in cases {
+        let label = if test_case.passed { "PASS" } else { "ERROR" }
+        println(
+          "\{label} \{test_case.case_name}: expected \{test_case.expected}; actual \{test_case.actual}",
+        )
+      }
+      println("报告已写入 \{output_dir}/report.json")
     }
-    println("报告已写入 \{output_dir}/report.json")
     return 2
   }
 
@@ -553,6 +596,7 @@ async fn run_config(
           },
           actual,
           passed,
+          !case_execution_ok,
           leaks,
           state_changes,
           cleanup_status,
@@ -574,17 +618,25 @@ async fn run_config(
   } else {
     1
   }
-  write_report(output_dir, exit_code, cases, setup_errors, execution_errors)
-  for test_case in cases {
-    let label = if test_case.passed { "PASS" } else { "FAIL" }
-    println(
-      "\{label} \{test_case.case_name}: expected \{test_case.expected}; actual \{test_case.actual}",
-    )
+  let report = write_report(
+    output_dir, exit_code, cases, setup_errors, execution_errors,
+  )
+  if output_format == "json" {
+    println(report.stringify(indent=2))
+  } else {
+    for test_case in cases {
+      let label = if test_case.passed { "PASS" } else { "FAIL" }
+      println(
+        "\{label} \{test_case.case_name}: expected \{test_case.expected}; actual \{test_case.actual}",
+      )
+    }
+    if failure_count > 0 {
+      println(
+        "已保存 \{failure_count} 个脱敏复现请求到 \{output_dir}",
+      )
+    }
+    println("报告已写入 \{output_dir}/report.json")
   }
-  if failure_count > 0 {
-    println("已保存 \{failure_count} 个脱敏复现请求到 \{output_dir}")
-  }
-  println("报告已写入 \{output_dir}/report.json")
   exit_code
 }
 
@@ -703,7 +755,7 @@ fn parse_inspection_config(
 ///|
 fn parse_run_arguments(
   args : Array[String],
-) -> (String, String, Array[String]) raise CliError {
+) -> (String, String, Array[String], String) raise CliError {
   if args.length() < 2 {
     raise CliError(
       "用法: moonauthz-regression run <config.json> [--out <目录>]",
@@ -711,6 +763,7 @@ fn parse_run_arguments(
   }
   let config_path = args[1]
   let mut output_dir = "artifacts"
+  let mut output_format = "human"
   let selected_cases : Array[String] = []
   let mut index = 2
   while index < args.length() {
@@ -720,11 +773,17 @@ fn parse_run_arguments(
     } else if args[index] == "--case" && index + 1 < args.length() {
       selected_cases.push(args[index + 1])
       index = index + 2
+    } else if args[index] == "--format" && index + 1 < args.length() {
+      output_format = args[index + 1]
+      if output_format != "human" && output_format != "json" {
+        raise CliError("--format 只能是 human 或 json")
+      }
+      index = index + 2
     } else {
       raise CliError("未知或不完整参数: " + args[index])
     }
   }
-  (config_path, output_dir, selected_cases)
+  (config_path, output_dir, selected_cases, output_format)
 }
 
 ///|
@@ -759,7 +818,7 @@ fn validate_case_selection(
 async fn run_cli_inner(args : Array[String]) -> Int {
   if args.length() == 0 || args[0] == "--help" || args[0] == "help" {
     println(
-      "用法: moonauthz-regression <run|validate|plan> <config.json> [--out <目录>]",
+      "用法: moonauthz-regression <run|validate|plan> <config.json> [--out <目录>] [--format human|json]",
     )
     return 0
   }
@@ -772,10 +831,34 @@ async fn run_cli_inner(args : Array[String]) -> Int {
   if args[0] != "run" {
     raise CliError("未知子命令: " + args[0])
   }
-  let (config_path, output_dir, selected_cases) = parse_run_arguments(args)
+  let (config_path, output_dir, selected_cases, output_format) = parse_run_arguments(
+    args,
+  )
   let config = load_config_file(config_path)
   validate_case_selection(config, selected_cases)
-  run_config(config, output_dir, selected_cases)
+  run_config(config, output_dir, selected_cases, output_format)
+}
+
+///|
+fn json_format_requested(args : Array[String]) -> Bool {
+  for index = 0; index + 1 < args.length(); index = index + 1 {
+    if args[index] == "--format" && args[index + 1] == "json" {
+      return true
+    }
+  }
+  false
+}
+
+///|
+fn print_json_cli_error(message : String) -> Unit {
+  println(
+    Json::object({
+      "tool": Json::string("moonauthz-regression"),
+      "status": Json::string("error"),
+      "exit_code": Json::Json(2),
+      "message": Json::string(message),
+    }).stringify(indent=2),
+  )
 }
 
 ///|
@@ -786,13 +869,21 @@ pub async fn run_cli(raw_args : Array[String]) -> Int {
   }
   run_cli_inner(args) catch {
     CliError(message) => {
-      println("ERROR: \{message}")
-      println("退出码: 2")
+      if json_format_requested(raw_args) {
+        print_json_cli_error(message)
+      } else {
+        println("ERROR: \{message}")
+        println("退出码: 2")
+      }
       2
     }
     err => {
-      println("ERROR: 网络、文件或 JSON 处理失败: \{err}")
-      println("退出码: 2")
+      if json_format_requested(raw_args) {
+        print_json_cli_error("网络、文件或 JSON 处理失败")
+      } else {
+        println("ERROR: 网络、文件或 JSON 处理失败: \{err}")
+        println("退出码: 2")
+      }
       2
     }
   }

@@ -62,6 +62,7 @@ priv struct TestCase {
   expected : String
   actual : String
   passed : Bool
+  execution_error : Bool
   leaks : Array[String]
   state_changes : Array[String]
   cleanup_status : Int?
