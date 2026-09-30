@@ -102,6 +102,24 @@ fn marker_sources_in(
 }
 
 ///|
+fn present_response_pointers(
+  body : String,
+  pointers : Array[String],
+) -> (Array[String], Bool) {
+  let found : Array[String] = []
+  if pointers.length() == 0 {
+    return (found, false)
+  }
+  let json = @json.parse(body) catch { _ => return (found, true) }
+  for pointer in pointers {
+    if json_pointer(json, pointer) is Some(_) {
+      found.push(pointer)
+    }
+  }
+  (found, false)
+}
+
+///|
 fn url_origin(url : String) -> String? {
   guard url.find("://") is Some(scheme_end) else { return None }
   let authority_start = scheme_end + 3
@@ -382,6 +400,19 @@ async fn run_config(
           baseline_markers[target_index],
           config.leak_detection,
         )
+        let (present_fields, invalid_json_for_presence_check) = present_response_pointers(
+          body,
+          config.forbidden_response_pointers,
+        )
+        for pointer in present_fields {
+          leaks.push("present:" + pointer)
+        }
+        if invalid_json_for_presence_check {
+          case_execution_ok = false
+          execution_errors.push(
+            "身份 \{actor.name} 的跨对象响应不是 JSON，无法检查配置的禁止字段",
+          )
+        }
         let denied = config.denied_statuses.contains(status)
         if config.request_method != "GET" {
           let target_url = build_url(config, target.object_id)
@@ -619,6 +650,7 @@ async fn validate_config_file(config_path : String) -> Int {
   println("请求方法: \{config.request_method}")
   println("测试身份: \{config.identities.length()}")
   println("跨身份用例: \{cross_case_count(config)}")
+  println("响应禁止字段: \{config.forbidden_response_pointers.length()}")
   println("配置和认证模板校验通过；未发送 HTTP 请求")
   0
 }
@@ -630,6 +662,9 @@ async fn print_config_plan(config_path : String) -> Int {
   println("目标服务: \{config.base_url}")
   println("基线请求: \{config.identities.length()} 个")
   println("跨身份请求: \{cross_case_count(config)} 个")
+  println(
+    "禁止响应字段: \{config.forbidden_response_pointers.length()} 个",
+  )
   for actor_index = 0
       actor_index < config.identities.length()
       actor_index = actor_index + 1 {

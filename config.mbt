@@ -20,6 +20,7 @@ priv struct AppConfig {
   request_body : String?
   object_id_pointer : String
   leak_detection : String
+  forbidden_response_pointers : Array[String]
   protected_pointers : Array[String]
   cleanup : CleanupConfig?
   common_headers : Map[String, String]
@@ -314,6 +315,19 @@ fn parse_config(root : Json) -> AppConfig raise CliError {
     "request.headers",
   )
 
+  let forbidden_response_pointers = string_array(
+    object_field(request, "forbidden_response_json_pointers"),
+    "request.forbidden_response_json_pointers",
+  )
+  for pointer in forbidden_response_pointers {
+    if !is_json_pointer(pointer) {
+      raise CliError(
+        "禁止出现在跨身份响应中的路径必须是有效 JSON Pointer: " +
+        pointer,
+      )
+    }
+  }
+
   let protected_pointers = string_array(
     object_field(request, "protected_json_pointers"),
     "request.protected_json_pointers",
@@ -429,6 +443,7 @@ fn parse_config(root : Json) -> AppConfig raise CliError {
     },
     object_id_pointer,
     leak_detection,
+    forbidden_response_pointers,
     protected_pointers,
     cleanup,
     common_headers,

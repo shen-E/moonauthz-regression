@@ -71,6 +71,8 @@ GitHub Actions 会在 push 和 pull request 时运行相同的验收流程。
 
 对象字段路径支持 JSON Pointer，包括嵌套对象和数组下标。默认 `leak_detection` 为 `json_pointer`：通过 `object_id_json_pointer`（默认 `/id`）定位对象 ID，并在自有对象基线中确认该字段与配置 ID 一致；敏感 JSON Pointer 的值也会按同一路径进行 JSON 值精确比较。这可避免短 ID 或常见子串造成误报。若接口返回非 JSON 响应，可将 `leak_detection` 设为 `substring`，对完整响应体执行子串扫描；这种模式可能因短字符串或常见文本产生误报。
 
+对于值可能被脱敏或变换、但字段本身绝不应暴露的场景，可在 `request.forbidden_response_json_pointers` 中列出 JSON Pointer。跨身份响应只要包含其中任一路径即判为泄露；若响应不是 JSON，则记录执行错误并以退出码 2 结束，避免静默略过检查。
+
 `request.path` 中的 `{{object_id}}` 必须恰好出现一次，可放在路径或 query 值中。ID 中的斜杠、问号、井号、百分号、与号等字符会编码为一个组件，不能改变请求路径或参数结构。路径模板不能包含 fragment 或反斜杠。
 
 基线 GET 必须返回配置的成功状态；结构化检测时对象 ID 路径缺失、对象 ID 与配置不符、敏感路径缺失或基线不是 JSON，运行作为配置/执行错误退出 2，不会把无效基线误报成通过。写请求除检查拒绝状态和响应泄露外，还会比较 owner 读回的受保护字段；每次跨身份写入后都会执行 cleanup 并复核这些字段是否恢复。
