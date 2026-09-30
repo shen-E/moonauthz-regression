@@ -18,6 +18,12 @@ MoonBit 编写的 API 对象级授权回归测试 CLI。它用 2 到 10 组身�
 
 `validate` 检查配置结构和认证环境变量是否可用，不会访问 API。`plan` 列出基线请求数、交叉身份组合和最终请求 URL，同样不发送请求；在运行写入配置前可用它检查预计触达的对象与清理流程。
 
+运行时可用重复的 `--case` 参数选择指定跨身份用例，例如：
+
+    moon run --target native cmd/main -- run examples/demo.json --case cross-A-to-B --case cross-B-to-A
+
+用例名可从 `plan` 输出复制。筛选仍会先验证配置中的全部身份和自有对象基线，然后只发送所选跨身份请求；未知或重复的用例名会在发出请求前报错。
+
 ### 一键验收
 
 安装 MoonBit 和 PowerShell 7 后，在仓库根目录运行：

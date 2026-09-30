@@ -250,8 +250,11 @@ async fn write_reproduction(
 }
 
 ///|
-async fn run_config(config_path : String, output_dir : String) -> Int {
-  let config = load_config_file(config_path)
+async fn run_config(
+  config : AppConfig,
+  output_dir : String,
+  selected_cases : Array[String],
+) -> Int {
   @fs.mkdir(output_dir, recursive=true, allow_exist=true)
   let cases : Array[TestCase] = []
   let setup_errors : Array[String] = []
@@ -343,6 +346,10 @@ async fn run_config(config_path : String, output_dir : String) -> Int {
       if actor_index != target_index {
         let actor = config.identities[actor_index]
         let target = config.identities[target_index]
+        let case_name = "cross-\{actor.name}-to-\{target.name}"
+        if selected_cases.length() > 0 && !selected_cases.contains(case_name) {
+          continue
+        }
         let url = build_url(config, target.object_id)
         ensure_same_origin(config, url)
         let request_body = if config.request_method == "GET" {
@@ -627,7 +634,9 @@ fn parse_inspection_config(
 }
 
 ///|
-fn parse_run_arguments(args : Array[String]) -> (String, String) raise CliError {
+fn parse_run_arguments(
+  args : Array[String],
+) -> (String, String, Array[String]) raise CliError {
   if args.length() < 2 {
     raise CliError(
       "用法: moonauthz-regression run <config.json> [--out <目录>]",
@@ -635,16 +644,48 @@ fn parse_run_arguments(args : Array[String]) -> (String, String) raise CliError 
   }
   let config_path = args[1]
   let mut output_dir = "artifacts"
+  let selected_cases : Array[String] = []
   let mut index = 2
   while index < args.length() {
     if args[index] == "--out" && index + 1 < args.length() {
       output_dir = args[index + 1]
       index = index + 2
+    } else if args[index] == "--case" && index + 1 < args.length() {
+      selected_cases.push(args[index + 1])
+      index = index + 2
     } else {
       raise CliError("未知或不完整参数: " + args[index])
     }
   }
-  (config_path, output_dir)
+  (config_path, output_dir, selected_cases)
+}
+
+///|
+fn validate_case_selection(
+  config : AppConfig,
+  selected_cases : Array[String],
+) -> Unit raise CliError {
+  for selected in selected_cases {
+    let mut found = false
+    for actor in config.identities {
+      for target in config.identities {
+        if actor.name != target.name &&
+          selected == "cross-\{actor.name}-to-\{target.name}" {
+          found = true
+        }
+      }
+    }
+    if !found {
+      raise CliError("未知跨身份用例: " + selected)
+    }
+  }
+  for i = 0; i < selected_cases.length(); i = i + 1 {
+    for j = 0; j < i; j = j + 1 {
+      if selected_cases[i] == selected_cases[j] {
+        raise CliError("--case 不能重复指定: " + selected_cases[i])
+      }
+    }
+  }
 }
 
 ///|
@@ -664,8 +705,10 @@ async fn run_cli_inner(args : Array[String]) -> Int {
   if args[0] != "run" {
     raise CliError("未知子命令: " + args[0])
   }
-  let (config_path, output_dir) = parse_run_arguments(args)
-  run_config(config_path, output_dir)
+  let (config_path, output_dir, selected_cases) = parse_run_arguments(args)
+  let config = load_config_file(config_path)
+  validate_case_selection(config, selected_cases)
+  run_config(config, output_dir, selected_cases)
 }
 
 ///|
